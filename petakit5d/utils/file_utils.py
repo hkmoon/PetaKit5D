@@ -87,7 +87,7 @@ def write_json_file(data: dict, filename: str) -> None:
         filename: Path to the output JSON file
         
     Original MATLAB function: writeJsonFile.m
-    Author: Xiongtao Ruan (05/01/2025)
+    Author: Xiongtao Ruan (01/08/2026) - Python conversion
     """
     filepath = Path(filename)
     
