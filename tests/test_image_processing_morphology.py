@@ -45,7 +45,7 @@ class TestBwLargestObj:
         result = bw_largest_obj(mask)
         
         # Should return empty mask
-        assert np.all(result == False)
+        assert not np.any(result)
     
     def test_3d_volume(self):
         """Test with 3D volume."""

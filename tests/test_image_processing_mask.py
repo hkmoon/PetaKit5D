@@ -18,7 +18,7 @@ class TestMaskVectors:
         
         result = mask_vectors(x_coords, y_coords, mask)
         
-        assert np.all(result == True)
+        assert np.all(result)
     
     def test_all_outside(self):
         """Test with all vectors outside the mask."""
@@ -28,7 +28,7 @@ class TestMaskVectors:
         
         result = mask_vectors(x_coords, y_coords, mask)
         
-        assert np.all(result == False)
+        assert not np.any(result)
     
     def test_mixed(self):
         """Test with some vectors inside and some outside."""

@@ -55,7 +55,7 @@ def invert_contrast(
     """
     Invert the input signal, preserving the dynamic range.
     
-    If a dynamic range is provided, the input first gets truncated to that range.
+    If a dynamic range is provided, the input first gets clipped to that range.
     This is different from simple negation - it maps [a, b] to [b, a] while
     preserving the dynamic range.
     
@@ -79,7 +79,7 @@ def invert_contrast(
     # Create a copy to avoid modifying the input
     output = input_array.copy().astype(float)
     
-    # Truncate to range if provided
+    # Clip to range if provided
     output = np.clip(output, range_in[0], range_in[1])
     
     # Invert: -input + sum(range)
