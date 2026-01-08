@@ -60,3 +60,54 @@ def bw_largest_obj(mask: np.ndarray, connectivity: Optional[int] = None) -> np.n
     output = (labeled == largest_label)
     
     return output
+
+
+def binary_sphere(radius: float) -> np.ndarray:
+    """
+    Create a 3D spherical neighborhood/structuring element for morphological operations.
+    
+    Generates a 3D logical matrix with values inside a sphere of the specified
+    radius being True and those outside being False.
+    
+    Args:
+        radius: Positive scalar radius of the sphere to generate.
+                Note that for:
+                - 0 < radius < 1: single True voxel returned
+                - 1 <= radius < sqrt(2): 6-connected neighborhood
+                - sqrt(2) <= radius < sqrt(3): 18-connected neighborhood  
+                - sqrt(3) <= radius < 2: 26-connected neighborhood
+        
+    Returns:
+        np.ndarray: 3D cubic logical matrix (neighborhood) of size ~2*radius+1
+        
+    Examples:
+        >>> sphere = binary_sphere(3.0)
+        >>> sphere.shape
+        (7, 7, 7)
+        >>> sphere[3, 3, 3]  # Center should be True
+        True
+        
+    Original MATLAB function: binarySphere.m
+    Author: Hunter Elliott (2/2010)
+    """
+    if radius <= 0:
+        raise ValueError('You must specify a single positive radius!')
+    
+    w = int(np.floor(radius))
+    
+    # Avoid numerical error for special radii like sqrt(2), sqrt(3)
+    if round(radius) != radius:
+        radius = radius + np.finfo(float).eps * radius
+    
+    # Get x, y, z coordinate matrices for distance-from-origin calculation
+    xx, yy, zz = np.meshgrid(
+        np.arange(-w, w + 1),
+        np.arange(-w, w + 1),
+        np.arange(-w, w + 1),
+        indexing='ij'
+    )
+    
+    # Return all points which are less than radius away from origin
+    sphere = (xx**2 + yy**2 + zz**2) <= radius**2
+    
+    return sphere

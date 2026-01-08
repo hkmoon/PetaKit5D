@@ -48,3 +48,54 @@ def mask_vectors(
                 inside_idx[ii] = True
     
     return inside_idx
+
+
+def angle_filter(
+    vec_x: np.ndarray,
+    vec_y: np.ndarray,
+    vec_mid: np.ndarray
+) -> np.ndarray:
+    """
+    Filter vectors based on angle from a reference direction.
+    
+    Returns True for vectors within -pi/3 to pi/3 radians from vec_mid direction.
+    
+    Args:
+        vec_x: X components of vectors to filter
+        vec_y: Y components of vectors to filter
+        vec_mid: Reference direction vector [x, y]
+        
+    Returns:
+        np.ndarray: Boolean array indicating which vectors pass the angle filter
+        
+    Examples:
+        >>> x = np.array([1, 0, -1])
+        >>> y = np.array([0, 1, 0])
+        >>> ref = np.array([1, 0])
+        >>> in_angle = angle_filter(x, y, ref)
+        
+    Original MATLAB function: angleFilter.m
+    """
+    n_points = len(vec_x)
+    in_ang_idx = np.zeros(n_points, dtype=bool)
+    
+    # Normalize reference vector
+    vec_mid = np.array(vec_mid)
+    vec_mid_norm = np.linalg.norm(vec_mid)
+    
+    for ii in range(n_points):
+        vec = np.array([vec_x[ii], vec_y[ii]])
+        vec_norm = np.linalg.norm(vec)
+        
+        if vec_norm > 0 and vec_mid_norm > 0:
+            # Calculate angle using dot product
+            cos_ang = np.dot(vec, vec_mid) / (vec_norm * vec_mid_norm)
+            # Clamp to [-1, 1] to avoid numerical issues with arccos
+            cos_ang = np.clip(cos_ang, -1.0, 1.0)
+            ang = np.arccos(cos_ang)
+            
+            # Check if angle is within -pi/3 to pi/3
+            if -np.pi / 3 < ang < np.pi / 3:
+                in_ang_idx[ii] = True
+    
+    return in_ang_idx
