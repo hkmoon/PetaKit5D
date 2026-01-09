@@ -12,6 +12,9 @@ from .mask import mask_vectors, angle_filter
 from .nms import non_maximum_suppression
 # from .splines import b3spline_1d, b3spline_2d  # TODO: Fix broadcasting issues
 from .local_stats import local_avg_std_2d
+from .gradient import gradient_filter_gauss_2d, gradient_filter_gauss_3d
+from .distance import bw_max_direct_dist, bw_n_neighbors
+from .visualization import rgb_overlay, z_proj_image
 
 __all__ = [
     "scale_contrast",
@@ -29,4 +32,10 @@ __all__ = [
     # "b3spline_1d",  # TODO: Fix broadcasting issues
     # "b3spline_2d",  # TODO: Fix broadcasting issues
     "local_avg_std_2d",
+    "gradient_filter_gauss_2d",
+    "gradient_filter_gauss_3d",
+    "bw_max_direct_dist",
+    "bw_n_neighbors",
+    "rgb_overlay",
+    "z_proj_image",
 ]
