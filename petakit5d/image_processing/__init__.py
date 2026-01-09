@@ -15,6 +15,8 @@ from .local_stats import local_avg_std_2d
 from .gradient import gradient_filter_gauss_2d, gradient_filter_gauss_3d
 from .distance import bw_max_direct_dist, bw_n_neighbors
 from .visualization import rgb_overlay, z_proj_image
+from .neighbors import bwn_hood_3d
+from .log_filter import filter_log
 
 __all__ = [
     "scale_contrast",
@@ -38,4 +40,6 @@ __all__ = [
     "bw_n_neighbors",
     "rgb_overlay",
     "z_proj_image",
+    "bwn_hood_3d",
+    "filter_log",
 ]
