@@ -20,6 +20,9 @@ from .log_filter import filter_log
 from .bilateral import bilateral_filter
 from .convn_fft import convn_fft
 from .nms_3d import non_maximum_suppression_3d
+from .morphology_thin import bw_thin
+from .fast_gauss import fast_gauss_3d
+from .surface_filter import surface_filter_gauss_3d
 
 __all__ = [
     "scale_contrast",
@@ -48,4 +51,7 @@ __all__ = [
     "bilateral_filter",
     "convn_fft",
     "non_maximum_suppression_3d",
+    "bw_thin",
+    "fast_gauss_3d",
+    "surface_filter_gauss_3d",
 ]
