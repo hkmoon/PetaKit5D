@@ -123,10 +123,13 @@ def bw_thin(bw: np.ndarray) -> np.ndarray:
         
         # For 3D, also rotate in the Z dimension
         if ndim == 3:
+            # Create copies to avoid in-place modification issues
+            n1_copy = n1.copy()
+            n2_copy = n2.copy()
             for k in range(3):
                 # Rotate in YZ plane
-                yz_slice_n1 = n1[k, :, :]
-                yz_slice_n2 = n2[k, :, :]
+                yz_slice_n1 = n1_copy[k, :, :]
+                yz_slice_n2 = n2_copy[k, :, :]
                 n1[k, :, :] = np.rot90(yz_slice_n1)
                 n2[k, :, :] = np.rot90(yz_slice_n2)
     

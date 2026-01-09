@@ -93,11 +93,12 @@ def surface_filter_gauss_3d(
     g = g / g_sum
     d2g = d2g / g_sum
     
-    # Apply filters - note the order and axis mapping
-    # scipy uses (z, y, x) ordering, MATLAB uses (y, x, z)
-    d2X = ndimage.convolve1d(input_img, d2g, axis=1, mode=mode)  # Y axis in numpy = X in MATLAB
-    d2X = ndimage.convolve1d(d2X, g, axis=0, mode=mode)  # X axis in numpy = Y in MATLAB  
-    d2X = ndimage.convolve1d(d2X, g, axis=2, mode=mode)  # Z axis
+    # Apply filters
+    # Note: MATLAB dimensions (Y, X, Z) map to numpy array indices (axis 0, axis 1, axis 2)
+    # d2X means second derivative in X direction (MATLAB dim 2 = numpy axis 1)
+    d2X = ndimage.convolve1d(input_img, g, axis=0, mode=mode)  # Smooth in Y (axis 0)
+    d2X = ndimage.convolve1d(d2X, d2g, axis=1, mode=mode)  # 2nd deriv in X (axis 1)
+    d2X = ndimage.convolve1d(d2X, g, axis=2, mode=mode)  # Smooth in Z (axis 2)
     
     # Filter in Y direction (axis 1, corresponding to MATLAB dimension 1)
     w = int(np.ceil(5 * sigma[1]))
@@ -110,9 +111,10 @@ def surface_filter_gauss_3d(
     g = g / g_sum
     d2g = d2g / g_sum
     
-    d2Y = ndimage.convolve1d(input_img, g, axis=1, mode=mode)
-    d2Y = ndimage.convolve1d(d2Y, d2g, axis=0, mode=mode)
-    d2Y = ndimage.convolve1d(d2Y, g, axis=2, mode=mode)
+    # d2Y means second derivative in Y direction (MATLAB dim 1 = numpy axis 0)
+    d2Y = ndimage.convolve1d(input_img, d2g, axis=0, mode=mode)  # 2nd deriv in Y (axis 0)
+    d2Y = ndimage.convolve1d(d2Y, g, axis=1, mode=mode)  # Smooth in X (axis 1)
+    d2Y = ndimage.convolve1d(d2Y, g, axis=2, mode=mode)  # Smooth in Z (axis 2)
     
     # Filter in Z direction (axis 0, corresponding to MATLAB dimension 3)
     w = int(np.ceil(5 * sigma[2]))
@@ -125,8 +127,9 @@ def surface_filter_gauss_3d(
     g = g / g_sum
     d2g = d2g / g_sum
     
-    d2Z = ndimage.convolve1d(input_img, g, axis=1, mode=mode)
-    d2Z = ndimage.convolve1d(d2Z, g, axis=0, mode=mode)
-    d2Z = ndimage.convolve1d(d2Z, d2g, axis=2, mode=mode)
+    # d2Z means second derivative in Z direction (MATLAB dim 3 = numpy axis 2)
+    d2Z = ndimage.convolve1d(input_img, g, axis=0, mode=mode)  # Smooth in Y (axis 0)
+    d2Z = ndimage.convolve1d(d2Z, g, axis=1, mode=mode)  # Smooth in X (axis 1)
+    d2Z = ndimage.convolve1d(d2Z, d2g, axis=2, mode=mode)  # 2nd deriv in Z (axis 2)
     
     return d2X, d2Y, d2Z
