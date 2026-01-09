@@ -33,7 +33,7 @@ def local_avg_std_2d(image: np.ndarray, window_size: int) -> Tuple[np.ndarray, n
     Original MATLAB function: localAvgStd2D.m
     Author: Francois Aguet (Last modified 09/19/2011)
     """
-    if (window_size + 1) % 2 != 0:
+    if window_size % 2 == 0:
         raise ValueError('The window length w must be an odd integer.')
     
     nan_mask = np.isnan(image)
