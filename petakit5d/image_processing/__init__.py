@@ -9,6 +9,9 @@ from .color import ch2rgb
 from .filters import filter_gauss_2d, filter_gauss_3d, filter_gauss_1d, conv3_fast
 from .morphology import bw_largest_obj, binary_sphere
 from .mask import mask_vectors, angle_filter
+from .nms import non_maximum_suppression
+# from .splines import b3spline_1d, b3spline_2d  # TODO: Fix broadcasting issues
+from .local_stats import local_avg_std_2d
 
 __all__ = [
     "scale_contrast",
@@ -22,4 +25,8 @@ __all__ = [
     "binary_sphere",
     "mask_vectors",
     "angle_filter",
+    "non_maximum_suppression",
+    # "b3spline_1d",  # TODO: Fix broadcasting issues
+    # "b3spline_2d",  # TODO: Fix broadcasting issues
+    "local_avg_std_2d",
 ]
