@@ -159,6 +159,13 @@ def write_zarr(
         warnings.warn(f"Unknown compressor '{compressor}', using default")
         comp = Blosc(cname='lz4', clevel=5, shuffle=Blosc.SHUFFLE)
     
-    # Create zarr array
-    mode = 'w' if overwrite else 'w-'
-    zarr.save(filepath, data, chunks=chunks, compressor=comp)
+    # Create zarr array with proper overwrite handling
+    # Force zarr_format=2 for compatibility with compressors
+    if overwrite:
+        z = zarr.open(filepath, mode='w', shape=data.shape, dtype=data.dtype, 
+                     chunks=chunks, compressor=comp, zarr_format=2)
+        z[:] = data
+    else:
+        z = zarr.open(filepath, mode='w-', shape=data.shape, dtype=data.dtype,
+                     chunks=chunks, compressor=comp, zarr_format=2)
+        z[:] = data

@@ -91,22 +91,18 @@ def gradient_filter_gauss_2d(
     dg = dg / g_sum
     
     # Compute gradients using separable convolution
-    # dX: derivative in X direction (horizontal, along columns)
+    # Pad image once and reuse for both directions
     if mode == 'constant' and 'cval' in locals():
         padded = np.pad(image, w, mode=mode, constant_values=cval)
     else:
         padded = np.pad(image, w, mode=mode)
     
+    # dX: derivative in X direction (horizontal, along columns)
     # Apply horizontal derivative, then vertical smoothing
     dX = ndimage.convolve1d(padded, dg, axis=1, mode='constant')[w:-w, w:-w]
     dX = ndimage.convolve1d(dX, g, axis=0, mode='constant')
     
     # dY: derivative in Y direction (vertical, along rows)
-    if mode == 'constant' and 'cval' in locals():
-        padded = np.pad(image, w, mode=mode, constant_values=cval)
-    else:
-        padded = np.pad(image, w, mode=mode)
-    
     # Apply vertical derivative, then horizontal smoothing
     dY = ndimage.convolve1d(padded, g, axis=1, mode='constant')[w:-w, w:-w]
     dY = ndimage.convolve1d(dY, dg, axis=0, mode='constant')
