@@ -17,6 +17,9 @@ from .distance import bw_max_direct_dist, bw_n_neighbors
 from .visualization import rgb_overlay, z_proj_image
 from .neighbors import bwn_hood_3d
 from .log_filter import filter_log
+from .bilateral import bilateral_filter
+from .convn_fft import convn_fft
+from .nms_3d import non_maximum_suppression_3d
 
 __all__ = [
     "scale_contrast",
@@ -42,4 +45,7 @@ __all__ = [
     "z_proj_image",
     "bwn_hood_3d",
     "filter_log",
+    "bilateral_filter",
+    "convn_fft",
+    "non_maximum_suppression_3d",
 ]
