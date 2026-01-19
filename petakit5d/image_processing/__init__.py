@@ -24,6 +24,7 @@ from .morphology_thin import bw_thin
 from .fast_gauss import fast_gauss_3d
 from .surface_filter import surface_filter_gauss_3d
 from .bspline_coeffs import b3spline_1d, b3spline_2d
+from .awt import awt_1d
 
 __all__ = [
     "scale_contrast",
@@ -57,4 +58,5 @@ __all__ = [
     "surface_filter_gauss_3d",
     "b3spline_1d",
     "b3spline_2d",
+    "awt_1d",
 ]

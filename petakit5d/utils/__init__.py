@@ -13,6 +13,8 @@ from .system_utils import get_hostname
 from .math_utils import find_good_factor_number
 from .path_utils import simplify_path
 from .spline_utils import ib3spline_1d, ib3spline_2d
+from .power_utils import fast_power
+from .image_utils import get_image_bounding_box, get_image_data_type
 
 __all__ = [
     "get_uuid",
@@ -27,4 +29,7 @@ __all__ = [
     "simplify_path",
     "ib3spline_1d",
     "ib3spline_2d",
+    "fast_power",
+    "get_image_bounding_box",
+    "get_image_data_type",
 ]
