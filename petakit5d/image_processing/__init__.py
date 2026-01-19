@@ -40,6 +40,8 @@ from .bspline_interp import (
     interp_bspline_value,
     calc_interp_maxima
 )
+from .hdr_merge import high_dynamic_range_merge
+from .binterp import binterp
 
 __all__ = [
     "scale_contrast",
@@ -87,4 +89,6 @@ __all__ = [
     "compute_bspline_coefficients",
     "interp_bspline_value",
     "calc_interp_maxima",
+    "high_dynamic_range_merge",
+    "binterp",
 ]
