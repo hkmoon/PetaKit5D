@@ -29,6 +29,11 @@ from .awt_2d import awt
 from .awt_denoising import awt_denoising
 from .filter_log_nd import filter_log_nd, filter_log_nd_with_kernel
 from .photobleach_correction import photobleach_correction, photobleach_correction_with_fit
+from .multiscale_filters import (
+    filter_multiscale_log_nd,
+    filter_lobg_nd,
+    filter_multiscale_lobg_nd
+)
 
 __all__ = [
     "scale_contrast",
@@ -69,4 +74,7 @@ __all__ = [
     "filter_log_nd_with_kernel",
     "photobleach_correction",
     "photobleach_correction_with_fit",
+    "filter_multiscale_log_nd",
+    "filter_lobg_nd",
+    "filter_multiscale_lobg_nd",
 ]
