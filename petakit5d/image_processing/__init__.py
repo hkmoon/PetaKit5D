@@ -25,6 +25,10 @@ from .fast_gauss import fast_gauss_3d
 from .surface_filter import surface_filter_gauss_3d
 from .bspline_coeffs import b3spline_1d, b3spline_2d
 from .awt import awt_1d
+from .awt_2d import awt
+from .awt_denoising import awt_denoising
+from .filter_log_nd import filter_log_nd, filter_log_nd_with_kernel
+from .photobleach_correction import photobleach_correction, photobleach_correction_with_fit
 
 __all__ = [
     "scale_contrast",
@@ -59,4 +63,10 @@ __all__ = [
     "b3spline_1d",
     "b3spline_2d",
     "awt_1d",
+    "awt",
+    "awt_denoising",
+    "filter_log_nd",
+    "filter_log_nd_with_kernel",
+    "photobleach_correction",
+    "photobleach_correction_with_fit",
 ]
