@@ -35,6 +35,11 @@ from .multiscale_filters import (
     filter_multiscale_lobg_nd
 )
 from .skeleton_utils import skeleton
+from .bspline_interp import (
+    compute_bspline_coefficients,
+    interp_bspline_value,
+    calc_interp_maxima
+)
 
 __all__ = [
     "scale_contrast",
@@ -79,4 +84,7 @@ __all__ = [
     "filter_lobg_nd",
     "filter_multiscale_lobg_nd",
     "skeleton",
+    "compute_bspline_coefficients",
+    "interp_bspline_value",
+    "calc_interp_maxima",
 ]
