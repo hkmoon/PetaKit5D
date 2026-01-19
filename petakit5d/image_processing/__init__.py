@@ -34,6 +34,7 @@ from .multiscale_filters import (
     filter_lobg_nd,
     filter_multiscale_lobg_nd
 )
+from .skeleton_utils import skeleton
 
 __all__ = [
     "scale_contrast",
@@ -77,4 +78,5 @@ __all__ = [
     "filter_multiscale_log_nd",
     "filter_lobg_nd",
     "filter_multiscale_lobg_nd",
+    "skeleton",
 ]
