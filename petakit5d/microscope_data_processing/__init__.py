@@ -9,7 +9,7 @@ from .io import read_tiff, write_tiff
 from .resample import resample_stack_3d, imresize3_average
 from .mip import max_pooling_3d, min_bbox_3d, project_3d_to_2d
 from .zarr_io import read_zarr, write_zarr
-from .decon_utils import decon_otf2psf
+from .decon_utils import decon_otf2psf, decon_psf2otf, decon_mask_edge_erosion
 from .stitch_utils import feather_distance_map_resize_3d
 
 __all__ = [
@@ -27,5 +27,7 @@ __all__ = [
     "read_zarr",
     "write_zarr",
     "decon_otf2psf",
+    "decon_psf2otf",
+    "decon_mask_edge_erosion",
     "feather_distance_map_resize_3d",
 ]
