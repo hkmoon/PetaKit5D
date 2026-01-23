@@ -11,6 +11,7 @@ from .mip import max_pooling_3d, min_bbox_3d, project_3d_to_2d
 from .zarr_io import read_zarr, write_zarr
 from .decon_utils import decon_otf2psf, decon_psf2otf, decon_mask_edge_erosion
 from .stitch_utils import feather_distance_map_resize_3d
+from .utils import check_resample_setting, estimate_computing_memory, group_partial_volume_files
 
 __all__ = [
     "crop_3d",
@@ -30,4 +31,7 @@ __all__ = [
     "decon_psf2otf",
     "decon_mask_edge_erosion",
     "feather_distance_map_resize_3d",
+    "check_resample_setting",
+    "estimate_computing_memory",
+    "group_partial_volume_files",
 ]
