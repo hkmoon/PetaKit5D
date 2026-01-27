@@ -13,6 +13,7 @@ from .decon_utils import decon_otf2psf, decon_psf2otf, decon_mask_edge_erosion
 from .stitch_utils import feather_distance_map_resize_3d
 from .stitch_utils_advanced import check_major_tile_valid, feather_blending_3d, normxcorr2_max_shift
 from .utils import check_resample_setting, estimate_computing_memory, group_partial_volume_files
+from .zarr_utils import create_zarr, write_zarr_block, integral_image_3d
 
 __all__ = [
     "crop_3d",
@@ -38,4 +39,7 @@ __all__ = [
     "check_resample_setting",
     "estimate_computing_memory",
     "group_partial_volume_files",
+    "create_zarr",
+    "write_zarr_block",
+    "integral_image_3d",
 ]
