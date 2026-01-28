@@ -14,6 +14,8 @@ from .stitch_utils import feather_distance_map_resize_3d
 from .stitch_utils_advanced import check_major_tile_valid, feather_blending_3d, normxcorr2_max_shift
 from .utils import check_resample_setting, estimate_computing_memory, group_partial_volume_files
 from .zarr_utils import create_zarr, write_zarr_block, integral_image_3d
+from .stitch_normxcorr import normxcorr3_fast, normxcorr3_max_shift
+from .volume_utils import erode_volume_by_2d_projection, process_flatfield_correction_frame
 
 __all__ = [
     "crop_3d",
@@ -42,4 +44,8 @@ __all__ = [
     "create_zarr",
     "write_zarr_block",
     "integral_image_3d",
+    "normxcorr3_fast",
+    "normxcorr3_max_shift",
+    "erode_volume_by_2d_projection",
+    "process_flatfield_correction_frame",
 ]
