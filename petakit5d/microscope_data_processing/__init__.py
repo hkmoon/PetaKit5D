@@ -16,6 +16,7 @@ from .utils import check_resample_setting, estimate_computing_memory, group_part
 from .zarr_utils import create_zarr, write_zarr_block, integral_image_3d
 from .stitch_normxcorr import normxcorr3_fast, normxcorr3_max_shift
 from .volume_utils import erode_volume_by_2d_projection, process_flatfield_correction_frame
+from .stitch_support import normalize_z_stack, distance_weight_single_axis, stitch_process_filenames
 
 __all__ = [
     "crop_3d",
@@ -48,4 +49,7 @@ __all__ = [
     "normxcorr3_max_shift",
     "erode_volume_by_2d_projection",
     "process_flatfield_correction_frame",
+    "normalize_z_stack",
+    "distance_weight_single_axis",
+    "stitch_process_filenames",
 ]
