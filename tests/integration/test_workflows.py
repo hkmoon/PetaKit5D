@@ -20,7 +20,7 @@ def test_basic_io_workflow():
         
         try:
             # Write and read
-            write_tiff(temp_file, data)
+            write_tiff(data, temp_file)
             loaded = read_tiff(temp_file)
             
             # Verify
@@ -63,7 +63,7 @@ def test_deconvolution_workflow():
         psf /= psf.sum()
         
         # Preprocess PSF
-        processed_psf = psf_gen(psf, dz_data=0.5, dz_psf=0.2, method='median')
+        processed_psf = psf_gen(psf, dz_psf=0.2, dz_data=0.5, psf_gen_method='median')
         
         # Convert to OTF
         otf = decon_psf2otf(processed_psf, (50, 100, 100))
@@ -87,7 +87,7 @@ def test_stitching_workflow():
         
         # Find offset
         offset = normxcorr2_max_shift(tile1[:, :, 50], tile2[:, :, 50], 
-                                       max_shifts=[20, 20])
+                                       maxShifts=np.array([20, 20]))
         
         # Verify offset is reasonable
         assert len(offset) == 2

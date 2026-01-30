@@ -338,15 +338,19 @@ def binterp(
     """
     f = np.asarray(f)
     
-    if f.ndim == 1 or (f.ndim == 2 and len(args) == 1):
-        # 1D case
+    if f.ndim == 1:
+        # 1D case - must have exactly 1 coordinate array
         if len(args) != 1:
             raise ValueError("For 1D interpolation, provide f and xi")
         xi = args[0]
         return binterp_1d(f, xi, border_condition)
     
-    elif f.ndim == 2 and len(args) == 2:
-        # 2D case
+    elif f.ndim == 2:
+        # 2D case - must have exactly 2 coordinate arrays
+        if len(args) == 1:
+            raise ValueError("For 2D interpolation, provide f, xi, and yi")
+        elif len(args) != 2:
+            raise ValueError("For 2D interpolation, provide f, xi, and yi")
         xi, yi = args
         return binterp_2d(f, xi, yi, border_condition)
     
