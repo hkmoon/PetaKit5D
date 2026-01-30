@@ -18,6 +18,8 @@ from .stitch_normxcorr import normxcorr3_fast, normxcorr3_max_shift
 from .volume_utils import erode_volume_by_2d_projection, process_flatfield_correction_frame
 from .stitch_support import normalize_z_stack, distance_weight_single_axis, stitch_process_filenames
 from .psf_analysis import psf_gen, rotate_psf
+from .deskew_rotate import deskew_frame_3d, rotate_frame_3d
+from .deskew_workflow import scmos_camera_flip, deskew_data
 
 __all__ = [
     "crop_3d",
@@ -55,4 +57,8 @@ __all__ = [
     "stitch_process_filenames",
     "psf_gen",
     "rotate_psf",
+    "deskew_frame_3d",
+    "rotate_frame_3d",
+    "scmos_camera_flip",
+    "deskew_data",
 ]

@@ -120,6 +120,16 @@ from .microscope_data_processing import (
     project_3d_to_2d,
 )
 
+# Deskewing workflow (Phase 33-34)
+from .microscope_data_processing.deskew_rotate import (
+    deskew_frame_3d,
+    rotate_frame_3d,
+)
+from .microscope_data_processing.deskew_workflow import (
+    scmos_camera_flip,
+    deskew_data,
+)
+
 __all__ = [
     # Version info
     "__version__",
@@ -198,4 +208,9 @@ __all__ = [
     "max_pooling_3d",
     "min_bbox_3d",
     "project_3d_to_2d",
+    # Deskewing (Phase 33-34)
+    "deskew_frame_3d",
+    "rotate_frame_3d",
+    "scmos_camera_flip",
+    "deskew_data",
 ]
