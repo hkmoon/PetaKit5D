@@ -21,7 +21,7 @@ def scmos_camera_flip(
 ) -> np.ndarray:
     """
     Flip image for sCMOS camera orientation correction.
-    
+
     Parameters
     ----------
     image : np.ndarray
@@ -30,7 +30,7 @@ def scmos_camera_flip(
         Flip mode: 'none', 'horizontal', 'vertical', or 'both' (default: 'none')
     axis : int, optional
         Axis to flip for 3D volumes (default: 1 for Y axis)
-        
+
     Returns
     -------
     np.ndarray
@@ -38,9 +38,9 @@ def scmos_camera_flip(
     """
     if flip_mode == 'none':
         return image
-    
+
     flipped = image.copy()
-    
+
     if image.ndim == 2:
         if flip_mode in ['horizontal', 'both']:
             flipped = np.flip(flipped, axis=1)
@@ -52,7 +52,7 @@ def scmos_camera_flip(
             flipped = np.flip(flipped, axis=2)  # X axis
         if flip_mode in ['vertical', 'both']:
             flipped = np.flip(flipped, axis=axis)  # Specified axis (usually Y)
-    
+
     return flipped
 
 
@@ -74,7 +74,7 @@ def deskew_data(
 ) -> Dict[str, Any]:
     """
     Complete deskewing workflow for light sheet microscopy data.
-    
+
     This function orchestrates the complete deskewing pipeline:
     1. Load input images
     2. Apply camera flip (if specified)
@@ -82,7 +82,7 @@ def deskew_data(
     4. Deskew volumes
     5. Rotate for visualization (optional)
     6. Save processed data
-    
+
     Parameters
     ----------
     input_paths : str or list of str
@@ -113,7 +113,7 @@ def deskew_data(
         Bounding box for cropping (z1, z2, y1, y2, x1, x2) (default: None)
     overwrite : bool, optional
         Whether to overwrite existing files (default: False)
-        
+
     Returns
     -------
     dict
@@ -122,7 +122,7 @@ def deskew_data(
         - 'output_dir': output directory path
         - 'deskewed_files': list of deskewed file paths
         - 'rotated_files': list of rotated file paths
-        
+
     Examples
     --------
     >>> # Simple deskewing
@@ -132,7 +132,7 @@ def deskew_data(
     ...     angle=32.45,
     ...     dz=0.5
     ... )
-    
+
     >>> # With rotation and corrections
     >>> result = deskew_data(
     ...     input_paths=['time001.tif', 'time002.tif'],
@@ -146,28 +146,28 @@ def deskew_data(
     # Convert to list
     if isinstance(input_paths, str):
         input_paths = [input_paths]
-    
+
     # Create output directory
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
-    
+
     # Load flat field if provided
     flat_field = None
     if flat_field_path is not None:
         flat_field = read_tiff(flat_field_path)
-    
+
     # Process each file
     deskewed_files = []
     rotated_files = []
-    
+
     for input_path in input_paths:
         input_file = Path(input_path)
         base_name = input_file.stem
-        
+
         # Define output paths
         deskew_out = output_path / f"{base_name}_deskewed.tif"
         rotate_out = output_path / f"{base_name}_rotated.tif"
-        
+
         # Check if files exist and skip if not overwriting
         if not overwrite:
             if save_deskew and deskew_out.exists():
@@ -176,15 +176,15 @@ def deskew_data(
                 if save_rotate and rotate_out.exists():
                     rotated_files.append(str(rotate_out))
                 continue
-        
+
         # Load data
         print(f"Processing {input_file.name}...")
         data = read_tiff(str(input_path))
-        
+
         # Apply camera flip
         if flip_mode != 'none':
             data = scmos_camera_flip(data, flip_mode)
-        
+
         # Apply flat field correction
         if flat_field is not None:
             data = process_flatfield_correction_frame(
@@ -192,12 +192,12 @@ def deskew_data(
                 flat_field,
                 background_correction=True
             )
-        
+
         # Apply bounding box crop if provided
         if bbox is not None:
             z1, z2, y1, y2, x1, x2 = bbox
             data = data[z1:z2, y1:y2, x1:x2]
-        
+
         # Deskew
         deskewed = deskew_frame_3d(
             data,
@@ -207,13 +207,13 @@ def deskew_data(
             reverse=reverse,
             interpolation=interpolation
         )
-        
+
         # Save deskewed
         if save_deskew:
-            write_tiff(str(deskew_out), deskewed)
+            write_tiff(deskewed, str(deskew_out))
             deskewed_files.append(str(deskew_out))
             print(f"  Saved deskewed: {deskew_out.name}")
-        
+
         # Rotate if requested
         if rotate:
             rotated = rotate_frame_3d(
@@ -224,12 +224,12 @@ def deskew_data(
                 reverse=reverse,
                 crop=True
             )
-            
+
             if save_rotate:
-                write_tiff(str(rotate_out), rotated)
+                write_tiff(rotated, str(rotate_out))
                 rotated_files.append(str(rotate_out))
                 print(f"  Saved rotated: {rotate_out.name}")
-    
+
     return {
         'n_files': len(input_paths),
         'output_dir': str(output_path),
