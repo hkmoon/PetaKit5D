@@ -15,7 +15,8 @@ def deskew_frame_3d(
     angle: float,
     pixel_size: float = 0.108,
     reverse: bool = False,
-    interpolation: str = 'linear'
+    interpolation: str = 'linear',
+    channel_axis: Optional[int] = None
 ) -> np.ndarray:
     """
     Deskew a 3D frame using shear transformation.
@@ -27,8 +28,8 @@ def deskew_frame_3d(
     ----------
     frame : np.ndarray
         Input 3D array to deskew (Z, Y, X). If a 2D array is provided,
-        it is treated as a single Z slice. If a 4D array is provided with
-        a singleton dimension, that dimension is squeezed.
+        it is treated as a single Z slice. For multi-channel data, provide
+        a 4D array (C, Z, Y, X) or (Z, Y, X, C) and specify channel_axis.
     dz : float
         Z step size in microns
     angle : float
@@ -39,11 +40,15 @@ def deskew_frame_3d(
         Whether scan direction is reversed (default: False)
     interpolation : str, optional
         Interpolation mode: 'linear' or 'cubic' (default: 'linear')
+    channel_axis : int, optional
+        Axis along which channels are stored for 4D input (default: None).
+        If None, 4D input is treated as before (squeeze singleton dimensions).
+        If specified (typically 0 or -1), each channel is processed independently.
 
     Returns
     -------
     np.ndarray
-        Deskewed 3D array
+        Deskewed 3D array (or 4D if multi-channel input with channel_axis specified)
 
     Notes
     -----
@@ -51,8 +56,40 @@ def deskew_frame_3d(
     dx = cos(angle) * dz / pixel_size  # pixels shifted per slice
 
     Output size is automatically calculated to fit the transformed volume.
+    
+    For multi-channel data, each channel is deskewed independently and the
+    channel dimension is preserved in the output.
     """
     frame = np.asarray(frame)
+    
+    # Handle multi-channel data
+    if frame.ndim == 4 and channel_axis is not None:
+        # Process each channel independently
+        n_channels = frame.shape[channel_axis]
+        deskewed_channels = []
+        
+        for i in range(n_channels):
+            # Extract single channel
+            if channel_axis == 0:
+                channel_data = frame[i]
+            elif channel_axis == -1 or channel_axis == 3:
+                channel_data = frame[..., i]
+            else:
+                raise ValueError(f"channel_axis must be 0 or -1 (or 3), got {channel_axis}")
+            
+            # Deskew single channel (recursive call without channel_axis)
+            deskewed_channel = deskew_frame_3d(
+                channel_data, dz, angle, pixel_size, reverse, interpolation, channel_axis=None
+            )
+            deskewed_channels.append(deskewed_channel)
+        
+        # Stack channels back together
+        if channel_axis == 0:
+            return np.stack(deskewed_channels, axis=0)
+        else:  # channel_axis == -1 or 3
+            return np.stack(deskewed_channels, axis=-1)
+    
+    # Original single-channel logic
     if frame.ndim == 2:
         frame = frame[None, ...]
     elif frame.ndim == 4:
@@ -62,7 +99,7 @@ def deskew_frame_3d(
         if frame.ndim != 3:
             raise ValueError(
                 f"deskew_frame_3d expects a 3D array (Z, Y, X); got shape {frame.shape}. "
-                "If this is time or channel data, select a single volume first."
+                "If this is multi-channel data, specify channel_axis parameter."
             )
     elif frame.ndim != 3:
         raise ValueError(
@@ -116,7 +153,8 @@ def rotate_frame_3d(
     dz: float,
     pixel_size: float = 0.108,
     reverse: bool = False,
-    crop: bool = True
+    crop: bool = True,
+    channel_axis: Optional[int] = None
 ) -> np.ndarray:
     """
     Rotate a 3D frame for isotropic visualization.
@@ -128,8 +166,8 @@ def rotate_frame_3d(
     ----------
     frame : np.ndarray
         Input 3D array to rotate (Z, Y, X). If a 2D array is provided,
-        it is treated as a single Z slice. If a 4D array is provided with
-        a singleton dimension, that dimension is squeezed.
+        it is treated as a single Z slice. For multi-channel data, provide
+        a 4D array (C, Z, Y, X) or (Z, Y, X, C) and specify channel_axis.
     angle : float
         Rotation angle in degrees (typically same as skew angle)
     dz : float
@@ -140,11 +178,15 @@ def rotate_frame_3d(
         Whether to reverse rotation direction (default: False)
     crop : bool, optional
         Whether to crop empty slices at boundaries (default: True)
+    channel_axis : int, optional
+        Axis along which channels are stored for 4D input (default: None).
+        If None, 4D input is treated as before (squeeze singleton dimensions).
+        If specified (typically 0 or -1), each channel is processed independently.
 
     Returns
     -------
     np.ndarray
-        Rotated 3D array
+        Rotated 3D array (or 4D if multi-channel input with channel_axis specified)
 
     Notes
     -----
@@ -155,8 +197,40 @@ def rotate_frame_3d(
 
     For sample scan: z_aniso = sin(angle) * dz / pixel_size
     For objective scan: z_aniso = dz / pixel_size
+    
+    For multi-channel data, each channel is rotated independently and the
+    channel dimension is preserved in the output.
     """
     frame = np.asarray(frame)
+    
+    # Handle multi-channel data
+    if frame.ndim == 4 and channel_axis is not None:
+        # Process each channel independently
+        n_channels = frame.shape[channel_axis]
+        rotated_channels = []
+        
+        for i in range(n_channels):
+            # Extract single channel
+            if channel_axis == 0:
+                channel_data = frame[i]
+            elif channel_axis == -1 or channel_axis == 3:
+                channel_data = frame[..., i]
+            else:
+                raise ValueError(f"channel_axis must be 0 or -1 (or 3), got {channel_axis}")
+            
+            # Rotate single channel (recursive call without channel_axis)
+            rotated_channel = rotate_frame_3d(
+                channel_data, angle, dz, pixel_size, reverse, crop, channel_axis=None
+            )
+            rotated_channels.append(rotated_channel)
+        
+        # Stack channels back together
+        if channel_axis == 0:
+            return np.stack(rotated_channels, axis=0)
+        else:  # channel_axis == -1 or 3
+            return np.stack(rotated_channels, axis=-1)
+    
+    # Original single-channel logic
     if frame.ndim == 2:
         frame = frame[None, ...]
     elif frame.ndim == 4:
@@ -165,7 +239,7 @@ def rotate_frame_3d(
         if frame.ndim != 3:
             raise ValueError(
                 f"rotate_frame_3d expects a 3D array (Z, Y, X); got shape {frame.shape}. "
-                "If this is time or channel data, select a single volume first."
+                "If this is multi-channel data, specify channel_axis parameter."
             )
     elif frame.ndim != 3:
         raise ValueError(
