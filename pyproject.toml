@@ -43,6 +43,7 @@ dependencies = [
     "scipy>=1.7.0",
     "tifffile>=2021.0.0",
     "scikit-image>=0.18.0",
+    "imagecodecs>=2021.0.0",
 ]
 
 [project.optional-dependencies]
