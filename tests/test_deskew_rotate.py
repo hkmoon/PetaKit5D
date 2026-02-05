@@ -231,5 +231,81 @@ def test_deskew_and_rotate_multichannel_pipeline():
     assert rotated.ndim == 4
 
 
+def test_rotate_frame_3d_xy_crop():
+    """Test automatic XY cropping after rotation."""
+    # Create test volume
+    frame = np.random.rand(10, 20, 30).astype(np.float32)
+    
+    # Without XY cropping
+    rotated_no_crop = rotate_frame_3d(frame, angle=32.45, dz=0.5, crop_xy=False)
+    
+    # With XY cropping (default)
+    rotated_with_crop = rotate_frame_3d(frame, angle=32.45, dz=0.5, crop_xy=True)
+    
+    # XY dimensions should be smaller or equal with cropping
+    assert rotated_with_crop.shape[1] <= rotated_no_crop.shape[1], "Y dimension should be <= uncropped"
+    assert rotated_with_crop.shape[2] <= rotated_no_crop.shape[2], "X dimension should be <= uncropped"
+    
+    # The cropped version should have no all-zero rows/columns at boundaries
+    # (it might have zeros in the middle, but not at edges)
+    if rotated_with_crop.size > 0:
+        # Check first and last Y rows aren't all zeros
+        assert np.any(rotated_with_crop[:, 0, :] > 0), "First Y row should have data"
+        assert np.any(rotated_with_crop[:, -1, :] > 0), "Last Y row should have data"
+        # Check first and last X columns aren't all zeros
+        assert np.any(rotated_with_crop[:, :, 0] > 0), "First X column should have data"
+        assert np.any(rotated_with_crop[:, :, -1] > 0), "Last X column should have data"
+
+
+def test_rotate_frame_3d_xy_crop_different_angles():
+    """Test XY cropping with different rotation angles."""
+    frame = np.random.rand(10, 20, 30).astype(np.float32)
+    
+    for angle in [15.0, 30.0, 45.0]:
+        # With cropping
+        rotated = rotate_frame_3d(frame, angle=angle, dz=0.5, crop_xy=True)
+        
+        # XY dimensions should be reduced
+        assert rotated.shape[1] <= 20, f"Y should be cropped for angle {angle}"
+        assert rotated.shape[2] <= 30, f"X should be cropped for angle {angle}"
+        
+        # Should have data at boundaries
+        if rotated.size > 0:
+            assert np.any(rotated[:, 0, :] > 0), f"First Y row should have data for angle {angle}"
+            assert np.any(rotated[:, :, 0] > 0), f"First X column should have data for angle {angle}"
+
+
+def test_rotate_frame_3d_xy_crop_multichannel():
+    """Test XY cropping with multi-channel data."""
+    # Create multi-channel test volume (C, Z, Y, X)
+    frame = np.random.rand(3, 10, 20, 30).astype(np.float32)
+    
+    # Without XY cropping
+    rotated_no_crop = rotate_frame_3d(frame, angle=32.45, dz=0.5, crop_xy=False, channel_axis=0)
+    
+    # With XY cropping
+    rotated_with_crop = rotate_frame_3d(frame, angle=32.45, dz=0.5, crop_xy=True, channel_axis=0)
+    
+    # Verify channels preserved
+    assert rotated_no_crop.shape[0] == 3
+    assert rotated_with_crop.shape[0] == 3
+    
+    # XY dimensions should be reduced
+    assert rotated_with_crop.shape[2] <= rotated_no_crop.shape[2], "Y should be cropped"
+    assert rotated_with_crop.shape[3] <= rotated_no_crop.shape[3], "X should be cropped"
+
+
+def test_rotate_frame_3d_backward_compatibility():
+    """Test that crop_xy=False maintains original behavior."""
+    frame = np.random.rand(10, 20, 30).astype(np.float32)
+    
+    # With crop_xy=False, Y and X dimensions should be unchanged
+    rotated = rotate_frame_3d(frame, angle=32.45, dz=0.5, crop=False, crop_xy=False)
+    
+    # Y and X dimensions should match input
+    assert rotated.shape[1] == 20, "Y dimension should be unchanged with crop_xy=False"
+    assert rotated.shape[2] == 30, "X dimension should be unchanged with crop_xy=False"
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])

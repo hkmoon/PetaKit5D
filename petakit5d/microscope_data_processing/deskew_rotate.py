@@ -154,6 +154,7 @@ def rotate_frame_3d(
     pixel_size: float = 0.108,
     reverse: bool = False,
     crop: bool = True,
+    crop_xy: bool = True,
     channel_axis: Optional[int] = None
 ) -> np.ndarray:
     """
@@ -177,7 +178,10 @@ def rotate_frame_3d(
     reverse : bool, optional
         Whether to reverse rotation direction (default: False)
     crop : bool, optional
-        Whether to crop empty slices at boundaries (default: True)
+        Whether to crop empty slices at Z boundaries (default: True)
+    crop_xy : bool, optional
+        Whether to crop empty regions in X,Y dimensions after rotation (default: True).
+        This removes padding introduced by rotation to minimize output size.
     channel_axis : int, optional
         Axis along which channels are stored for 4D input (default: None).
         If None, 4D input is treated as before (squeeze singleton dimensions).
@@ -186,7 +190,9 @@ def rotate_frame_3d(
     Returns
     -------
     np.ndarray
-        Rotated 3D array (or 4D if multi-channel input with channel_axis specified)
+        Rotated 3D array (or 4D if multi-channel input with channel_axis specified).
+        If crop_xy=True, the output dimensions in Y and X will be reduced to fit
+        the rotated content, removing empty padding.
 
     Notes
     -----
@@ -200,6 +206,23 @@ def rotate_frame_3d(
     
     For multi-channel data, each channel is rotated independently and the
     channel dimension is preserved in the output.
+    
+    When crop_xy=True (default), the output size is automatically adjusted to 
+    the minimal bounding box containing non-zero data. This removes empty padding
+    introduced by rotation, resulting in more compact output.
+    
+    Examples
+    --------
+    >>> # Without XY cropping (original behavior)
+    >>> data = np.random.rand(10, 20, 30)
+    >>> rotated = rotate_frame_3d(data, angle=32.45, dz=0.5, crop_xy=False)
+    >>> rotated.shape  # Same Y,X as input
+    (10, 20, 30)
+    
+    >>> # With XY cropping (new default)
+    >>> rotated_cropped = rotate_frame_3d(data, angle=32.45, dz=0.5, crop_xy=True)
+    >>> rotated_cropped.shape  # Y,X reduced to fit content
+    (10, 18, 25)  # Example - actual values depend on rotation
     """
     frame = np.asarray(frame)
     
@@ -220,7 +243,7 @@ def rotate_frame_3d(
             
             # Rotate single channel (recursive call without channel_axis)
             rotated_channel = rotate_frame_3d(
-                channel_data, angle, dz, pixel_size, reverse, crop, channel_axis=None
+                channel_data, angle, dz, pixel_size, reverse, crop, crop_xy, channel_axis=None
             )
             rotated_channels.append(rotated_channel)
         
@@ -316,11 +339,26 @@ def rotate_frame_3d(
     )
 
     if crop:
-        # Crop empty slices at top and bottom
+        # Crop empty slices at top and bottom (Z dimension)
         nonzero_slices = np.any(rotated > 0, axis=(1, 2))
         if np.any(nonzero_slices):
             first_slice = np.argmax(nonzero_slices)
             last_slice = len(nonzero_slices) - np.argmax(nonzero_slices[::-1]) - 1
             rotated = rotated[first_slice:last_slice+1]
+    
+    if crop_xy:
+        # Crop empty regions in Y dimension
+        nonzero_y = np.any(rotated > 0, axis=(0, 2))
+        if np.any(nonzero_y):
+            first_y = np.argmax(nonzero_y)
+            last_y = len(nonzero_y) - np.argmax(nonzero_y[::-1]) - 1
+            rotated = rotated[:, first_y:last_y+1, :]
+        
+        # Crop empty regions in X dimension
+        nonzero_x = np.any(rotated > 0, axis=(0, 1))
+        if np.any(nonzero_x):
+            first_x = np.argmax(nonzero_x)
+            last_x = len(nonzero_x) - np.argmax(nonzero_x[::-1]) - 1
+            rotated = rotated[:, :, first_x:last_x+1]
 
     return rotated
