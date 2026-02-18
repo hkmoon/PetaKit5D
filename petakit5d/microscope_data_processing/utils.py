@@ -188,8 +188,9 @@ def estimate_computing_memory(
                 raise ValueError('Cannot determine image size from file. Please provide im_size parameter.')
         
         # Compute raw image size in GB (assume float32 = 4 bytes)
+        # Use dtype=np.int64 to prevent overflow on Windows/32-bit systems
         if im_size is not None:
-            raw_image_size = np.prod(im_size) * 4 / (1024**3)
+            raw_image_size = np.prod(im_size, dtype=np.int64) * 4 / (1024**3)
         else:
             # Try to get file size
             raw_image_size = os.path.getsize(file_path) / (1024**3)
