@@ -43,10 +43,12 @@ dependencies = [
     "scipy>=1.7.0",
     "tifffile>=2021.0.0",
     "scikit-image>=0.18.0",
-    "imagecodecs>=2021.0.0",
 ]
 
 [project.optional-dependencies]
+imagecodecs = [
+    "imagecodecs>=2021.0.0",
+]
 zarr = [
     "zarr>=2.10.0",
     "numcodecs>=0.9.0",
@@ -65,7 +67,7 @@ docs = [
     "ipykernel>=6.0.0",
 ]
 all = [
-    "petakit5d[zarr,dev,docs]",
+    "petakit5d[imagecodecs,zarr,dev,docs]",
 ]
 
 [project.urls]
