@@ -194,7 +194,8 @@ def estimate_computing_memory(
             # Try to get file size
             raw_image_size = os.path.getsize(file_path) / (1024**3)
     else:
-        raw_image_size = data_size * 2 / (1024**3)
+        # data_size is already in GB
+        raw_image_size = data_size
     
     # Estimate memory for each step
     est_required_memory = np.zeros(len(steps))
