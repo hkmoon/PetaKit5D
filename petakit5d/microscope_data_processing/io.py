@@ -200,7 +200,11 @@ def write_tiff(
                     if 'Channel' in metadata:
                         write_params['metadata']['Channel'] = metadata['Channel']
             else:
-                write_params['imagej'] = True
+                # ImageJ format doesn't support float64, convert to float32
+                if img.dtype == np.float64:
+                    write_params['imagej'] = False
+                else:
+                    write_params['imagej'] = True
 
             # Write the TIFF file
             tifffile.imwrite(filepath, img, **write_params)
