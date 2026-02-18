@@ -12,3 +12,15 @@ mcc/linux_with_jvm/*
 mcc/mac/*
 mcc/windows/*
 mcc/windows_with_jvm/*
+
+# Python package files
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+venv/
+ENV/
+env/
