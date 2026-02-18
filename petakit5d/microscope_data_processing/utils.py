@@ -205,8 +205,9 @@ def estimate_computing_memory(
         
         if 'deskew' in step_lower:
             # Use 300 slices as threshold for scaling
+            # Use linear scaling instead of quadratic for more realistic memory estimates
             if im_size is not None:
-                scale_factor = max(1.0, (im_size[2] / 300) ** 2)
+                scale_factor = max(1.0, im_size[2] / 300)
             else:
                 scale_factor = 1.0
             est_required_memory[i] = raw_image_size * mem_factors[0] * scale_factor
