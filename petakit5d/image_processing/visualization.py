@@ -83,28 +83,19 @@ def rgb_overlay(
     for mask in masks:
         comb_idx |= mask
     
-    # Start with grayscale, but suppress where overlays exist
-    img_rgb = img.copy()
-    img_rgb[comb_idx] = 0
+    # Start with RGB grayscale image
+    img_rgb = np.stack([img] * 3, axis=2)
     
-    # Replicate to create RGB image
-    img_rgb = np.stack([img_rgb] * 3, axis=2)
-    
-    # Add each color channel
+    # Add each colored overlay
     for c in range(3):
         # Accumulate masks weighted by their colors for this channel
         c_mask = np.zeros(img.shape, dtype=np.float64)
         for k in range(nm):
             c_mask += colors[k][c] * masks[k].astype(np.float64)
         
-        # Clip to [0, 1]
-        c_mask = np.minimum(c_mask, 1.0)
-        
-        # Where mask is 1, show original grayscale; otherwise show colored overlay
-        idx = (c_mask == 1.0)
-        tmp = img_rgb[:, :, c].copy()
-        tmp[idx] = img[idx]
-        img_rgb[:, :, c] = tmp
+        # Add the overlay contribution to grayscale base
+        # Where masks are present, add the color overlay
+        img_rgb[:, :, c] = np.clip(img_rgb[:, :, c] + c_mask, 0, 1)
     
     # Convert to uint8
     img_rgb = np.clip(img_rgb * 255, 0, 255).astype(np.uint8)

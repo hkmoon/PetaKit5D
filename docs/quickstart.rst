@@ -14,7 +14,7 @@ Reading and writing TIFF files::
     image = read_tiff('input.tif')
 
     # Write a TIFF file
-    write_tiff('output.tif', image)
+    write_tiff(image, 'output.tif')
 
 Working with Zarr::
 
@@ -42,7 +42,7 @@ Bilateral filtering::
     from petakit5d import bilateral_filter
 
     # Edge-preserving smoothing
-    smoothed = bilateral_filter(image, sigma_spatial=5, sigma_intensity=0.1)
+    smoothed = bilateral_filter(image, sigma_s=5, sigma_r=0.1)
 
 Deconvolution Workflow
 ----------------------

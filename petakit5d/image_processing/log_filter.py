@@ -74,10 +74,8 @@ def filter_log(signal: np.ndarray, sigma: float) -> np.ndarray:
         signal_flat = signal.ravel()
         nx = len(signal_flat)
         
-        # Create frequency grid
-        w1 = np.arange(-nx//2, nx//2)
-        w1 = np.fft.fftshift(w1)
-        w1 = w1 * 2 * np.pi / nx
+        # Create frequency grid using fftfreq for correct size
+        w1 = np.fft.fftfreq(nx) * 2 * np.pi
         
         # Compute FFT
         I = np.fft.fft(signal_flat)
@@ -95,16 +93,10 @@ def filter_log(signal: np.ndarray, sigma: float) -> np.ndarray:
         # 2D filtering
         ny, nx = signal.shape
         
-        # Create frequency grids
-        w1, w2 = np.meshgrid(
-            np.arange(-nx//2, nx//2),
-            np.arange(-ny//2, ny//2)
-        )
-        w1 = np.fft.fftshift(w1)
-        w2 = np.fft.fftshift(w2)
-        
-        w1 = w1 * 2 * np.pi / nx
-        w2 = w2 * 2 * np.pi / ny
+        # Create frequency grids using fftfreq for correct sizes
+        w1 = np.fft.fftfreq(nx) * 2 * np.pi
+        w2 = np.fft.fftfreq(ny) * 2 * np.pi
+        w1, w2 = np.meshgrid(w1, w2, indexing='xy')
         
         # Compute FFT
         I = np.fft.fft2(signal)
@@ -120,20 +112,11 @@ def filter_log(signal: np.ndarray, sigma: float) -> np.ndarray:
         # 3D filtering
         ny, nx, nz = signal.shape
         
-        # Create frequency grids
-        w1, w2, w3 = np.meshgrid(
-            np.arange(-nx//2, nx//2),
-            np.arange(-ny//2, ny//2),
-            np.arange(-nz//2, nz//2),
-            indexing='xy'
-        )
-        w1 = np.fft.fftshift(w1)
-        w2 = np.fft.fftshift(w2)
-        w3 = np.fft.fftshift(w3)
-        
-        w1 = w1 * 2 * np.pi / nx
-        w2 = w2 * 2 * np.pi / ny
-        w3 = w3 * 2 * np.pi / nz
+        # Create frequency grids using fftfreq for correct sizes
+        w1 = np.fft.fftfreq(nx) * 2 * np.pi
+        w2 = np.fft.fftfreq(ny) * 2 * np.pi
+        w3 = np.fft.fftfreq(nz) * 2 * np.pi
+        w1, w2, w3 = np.meshgrid(w1, w2, w3, indexing='xy')
         
         # Compute FFT
         I = np.fft.fftn(signal)

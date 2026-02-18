@@ -61,6 +61,11 @@ def bilateral_filter(img: np.ndarray, sigma_s: float, sigma_r: float) -> np.ndar
         raise ValueError("bilateral_filter only supports 2D images")
     
     T = np.max(img)
+    
+    # Handle constant-zero or near-zero images
+    if T == 0 or T < 1e-10:
+        return img.copy()
+    
     ny, nx = img.shape
     
     gamma = np.pi / (2 * T)

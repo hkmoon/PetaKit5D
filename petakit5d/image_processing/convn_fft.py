@@ -72,6 +72,12 @@ def convn_fft(
     
     nd = max(A.ndim, B.ndim)
     
+    # Reshape both arrays to have the same number of dimensions
+    if A.ndim < nd:
+        A = A.reshape(A.shape + (1,) * (nd - A.ndim))
+    if B.ndim < nd:
+        B = B.reshape(B.shape + (1,) * (nd - B.ndim))
+    
     # Handle dims parameter
     if dims is None:
         dims = tuple(range(nd))

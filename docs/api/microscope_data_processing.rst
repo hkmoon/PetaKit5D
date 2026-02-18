@@ -41,6 +41,6 @@ Stitching
 MIP Utilities
 -------------
 
-.. automodule:: petakit5d.microscope_data_processing.mip_utils
+.. automodule:: petakit5d.microscope_data_processing.mip
    :members:
    :undoc-members:

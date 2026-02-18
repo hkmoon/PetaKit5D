@@ -54,20 +54,20 @@ def get_image_bounding_box(image: np.ndarray) -> Tuple[int, ...]:
     if nd not in [2, 3]:
         raise ValueError(f"Image must be 2D or 3D, got {nd}D")
     
-    # Sum along different axes to find extents
+    # Use boolean projection to robustly detect non-zero support
     if nd == 3:
-        # For 3D: sum along axes (1, 2) for Y, (0, 2) for X, (0, 1) for Z
-        I_y = np.sum(image, axis=(1, 2))
-        I_x = np.sum(image, axis=(0, 2))
-        I_z = np.sum(image, axis=(0, 1))
+        # For 3D: check for non-zero values along axes
+        I_y = np.any(image != 0, axis=(1, 2))
+        I_x = np.any(image != 0, axis=(0, 2))
+        I_z = np.any(image != 0, axis=(0, 1))
     else:
-        # For 2D: sum along axis 1 for Y, axis 0 for X
-        I_y = np.sum(image, axis=1)
-        I_x = np.sum(image, axis=0)
+        # For 2D: check for non-zero values along axes
+        I_y = np.any(image != 0, axis=1)
+        I_x = np.any(image != 0, axis=0)
     
     # Find first and last non-zero indices (0-based)
-    y_nz = np.where(I_y > 0)[0]
-    x_nz = np.where(I_x > 0)[0]
+    y_nz = np.where(I_y)[0]
+    x_nz = np.where(I_x)[0]
     
     if len(y_nz) == 0 or len(x_nz) == 0:
         # Empty image - return zeros
@@ -81,7 +81,7 @@ def get_image_bounding_box(image: np.ndarray) -> Tuple[int, ...]:
     x2 = x_nz[-1]
     
     if nd == 3:
-        z_nz = np.where(I_z > 0)[0]
+        z_nz = np.where(I_z)[0]
         if len(z_nz) == 0:
             return (0, 0, 0, 0, 0, 0)
         z1 = z_nz[0]

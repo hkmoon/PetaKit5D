@@ -228,3 +228,52 @@ def test_convn_fft_large_kernel():
     result = convn_fft(A, B, shape='same')
     
     assert result.shape == A.shape
+
+
+def test_convn_fft_mixed_dimensions_2d_1d():
+    """Test 2D array with 1D kernel."""
+    A = np.random.rand(10, 10)
+    B = np.random.rand(3)
+    
+    # Should work - B gets reshaped to match A's dimensions
+    result = convn_fft(A, B, shape='same')
+    
+    assert result.shape == A.shape
+
+
+def test_convn_fft_mixed_dimensions_3d_2d():
+    """Test 3D array with 2D kernel."""
+    A = np.random.rand(10, 10, 10)
+    B = np.random.rand(3, 3)
+    
+    # Should work - B gets reshaped to match A's dimensions
+    result = convn_fft(A, B, shape='same')
+    
+    assert result.shape == A.shape
+
+
+def test_convn_fft_dims_specific_axis():
+    """Test convolution along specific axis when dimensions differ."""
+    A = np.random.rand(10, 20)
+    B = np.random.rand(3)
+    
+    # Convolve only along axis 0
+    result = convn_fft(A, B, shape='same', dims=0)
+    
+    assert result.shape == A.shape
+
+
+def test_convn_fft_odd_even_kernels():
+    """Test with both odd and even sized kernels."""
+    A = np.random.rand(20, 20)
+    
+    # Odd kernel
+    B_odd = np.random.rand(5, 5)
+    result_odd = convn_fft(A, B_odd, shape='same')
+    assert result_odd.shape == A.shape
+    
+    # Even kernel
+    B_even = np.random.rand(4, 4)
+    result_even = convn_fft(A, B_even, shape='same')
+    assert result_even.shape == A.shape
+
