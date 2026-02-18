@@ -163,9 +163,26 @@ def write_tiff(
                     "Install it with: pip install tifffile"
                 )
 
+            # Check if imagecodecs is available for compression
+            try:
+                import imagecodecs
+                imagecodecs_available = True
+            except ImportError:
+                imagecodecs_available = False
+
             # Set compression parameter
             if compression.lower() == 'lzw':
-                compress = 'lzw'
+                if imagecodecs_available:
+                    compress = 'lzw'
+                else:
+                    # Fall back to no compression if imagecodecs not available
+                    compress = None
+                    import warnings
+                    warnings.warn(
+                        "imagecodecs not available, writing without compression. "
+                        "Install imagecodecs for LZW compression support: pip install imagecodecs",
+                        UserWarning
+                    )
             else:
                 compress = None
 
