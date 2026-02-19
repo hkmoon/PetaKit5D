@@ -24,3 +24,5 @@ htmlcov/
 venv/
 ENV/
 env/
+
+petakit5drs/target
