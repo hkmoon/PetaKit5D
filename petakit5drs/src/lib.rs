@@ -59,6 +59,8 @@ pub use stitch::{
     stitch_process_filenames, StitchingError,
 };
 pub use utils::{
-    find_good_factor_number, get_hostname, get_image_data_type, get_image_size, get_uuid,
-    mat2str_comma, mkdir_recursive, simplify_path,
+    axis_order_mapping, data_type_to_byte_number, fast_power, find_good_factor_number,
+    get_hostname, get_image_bounding_box, get_image_data_type, get_image_size, get_uuid,
+    ib3spline_1d, ib3spline_2d, mat2str_comma, mkdir_recursive, read_text_file, simplify_path,
+    write_json_file, write_text_file,
 };

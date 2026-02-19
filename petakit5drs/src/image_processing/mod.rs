@@ -291,6 +291,116 @@ pub fn filter_gauss_2d(input: &[f64], rows: usize, cols: usize, sigma: f64) -> V
     output
 }
 
+/// 3D Gaussian filtering
+///
+/// Applies a separable 3D Gaussian filter to a volume.
+/// Supports isotropic (single sigma) or anisotropic (sigma_xy, sigma_z) filtering.
+///
+/// # Arguments
+/// * `input` - Input 3D array (flattened, row-major order)
+/// * `depth` - Number of Z slices
+/// * `height` - Number of rows (Y)
+/// * `width` - Number of columns (X)
+/// * `sigma_xy` - Standard deviation for X and Y axes
+/// * `sigma_z` - Standard deviation for Z axis
+///
+/// # Returns
+/// * `Vec<f64>` - Filtered volume
+pub fn filter_gauss_3d(
+    input: &[f64],
+    depth: usize,
+    height: usize,
+    width: usize,
+    sigma_xy: f64,
+    sigma_z: f64,
+) -> Vec<f64> {
+    if input.is_empty() || depth == 0 || height == 0 || width == 0 {
+        return vec![];
+    }
+
+    if sigma_xy <= 0.0 && sigma_z <= 0.0 {
+        return input.to_vec();
+    }
+
+    let make_kernel = |sigma: f64| -> Vec<f64> {
+        if sigma <= 0.0 {
+            return vec![1.0];
+        }
+        let w = (3.0 * sigma).ceil() as usize;
+        let size = 2 * w + 1;
+        let sigma_sq = sigma * sigma;
+        let mut k: Vec<f64> = (0..size)
+            .map(|i| {
+                let x = i as f64 - w as f64;
+                (-0.5 * x * x / sigma_sq).exp()
+            })
+            .collect();
+        let sum: f64 = k.iter().sum();
+        if sum != 0.0 {
+            k.iter_mut().for_each(|v| *v /= sum);
+        }
+        k
+    };
+
+    let k_xy = make_kernel(sigma_xy);
+    let k_z = make_kernel(sigma_z);
+    let r_xy = k_xy.len() / 2;
+    let r_z = k_z.len() / 2;
+
+    // Convolve along X
+    let mut buf = vec![0.0f64; depth * height * width];
+    for z in 0..depth {
+        for y in 0..height {
+            for x in 0..width {
+                let mut sum = 0.0;
+                for (ki, &kv) in k_xy.iter().enumerate() {
+                    let xi = x as isize + ki as isize - r_xy as isize;
+                    if xi >= 0 && xi < width as isize {
+                        sum += input[z * height * width + y * width + xi as usize] * kv;
+                    }
+                }
+                buf[z * height * width + y * width + x] = sum;
+            }
+        }
+    }
+
+    // Convolve along Y
+    let buf_x = buf.clone();
+    for z in 0..depth {
+        for y in 0..height {
+            for x in 0..width {
+                let mut sum = 0.0;
+                for (ki, &kv) in k_xy.iter().enumerate() {
+                    let yi = y as isize + ki as isize - r_xy as isize;
+                    if yi >= 0 && yi < height as isize {
+                        sum += buf_x[z * height * width + yi as usize * width + x] * kv;
+                    }
+                }
+                buf[z * height * width + y * width + x] = sum;
+            }
+        }
+    }
+
+    // Convolve along Z
+    let buf_y = buf.clone();
+    for z in 0..depth {
+        for y in 0..height {
+            for x in 0..width {
+                let mut sum = 0.0;
+                for (ki, &kv) in k_z.iter().enumerate() {
+                    let zi = z as isize + ki as isize - r_z as isize;
+                    if zi >= 0 && zi < depth as isize {
+                        sum += buf_y[zi as usize * height * width + y * width + x] * kv;
+                    }
+                }
+                buf[z * height * width + y * width + x] = sum;
+            }
+        }
+    }
+
+    buf
+}
+
 /// Fast 3D convolution with separable kernels
 ///
 /// Applies separable 1D convolutions along each axis for efficient 3D filtering.
@@ -440,5 +550,32 @@ mod tests {
         let result = filter_gauss_2d(&data, 5, 5, 1.0);
         assert_eq!(result.len(), 25);
         // Should be similar to original but smoothed
+    }
+
+    #[test]
+    fn test_filter_gauss_3d_isotropic() {
+        let data = vec![1.0; 125]; // 5x5x5 volume
+        let result = filter_gauss_3d(&data, 5, 5, 5, 1.0, 1.0);
+        assert_eq!(result.len(), 125);
+    }
+
+    #[test]
+    fn test_filter_gauss_3d_anisotropic() {
+        let data = vec![1.0; 150]; // 5x5x6 volume
+        let result = filter_gauss_3d(&data, 5, 5, 6, 2.0, 1.0);
+        assert_eq!(result.len(), 150);
+    }
+
+    #[test]
+    fn test_filter_gauss_3d_passthrough() {
+        let data = vec![1.0; 27]; // 3x3x3 volume, sigma=0
+        let result = filter_gauss_3d(&data, 3, 3, 3, 0.0, 0.0);
+        assert_eq!(result, data);
+    }
+
+    #[test]
+    fn test_filter_gauss_3d_empty() {
+        let result = filter_gauss_3d(&[], 5, 5, 5, 1.0, 1.0);
+        assert!(result.is_empty());
     }
 }
