@@ -41,9 +41,11 @@ pub use io::{
 pub use microscope_data_processing::{
     crop_3d,
     crop_4d,
+    deskew_frame_3d,
     group_partial_volume_files,
     project_3d_to_2d,
     resample_stack_3d,
+    rotate_frame_3d,
     MicroscopeProcessingError,
     // microscope_data_processing::create_zarr is available as
     // `petakit5drs::microscope_data_processing::create_zarr`
