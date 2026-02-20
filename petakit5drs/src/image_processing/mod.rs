@@ -3702,6 +3702,354 @@ pub fn skeleton(
     }
 }
 
+// ---------------------------------------------------------------------------
+// LoG filter with kernel returned
+// ---------------------------------------------------------------------------
+
+/// Apply LoG filter and additionally return the 3-D kernel used.
+///
+/// Identical to [`filter_log_nd`] but returns `(response, kernel)` so callers
+/// can inspect or reuse the kernel without rebuilding it.
+///
+/// # Returns
+/// `(response, kernel)` where:
+/// * `response` has the same length as `data`,
+/// * `kernel` is a flat ZYX row-major array of the separable LoG kernel.
+pub fn filter_log_nd_with_kernel(
+    data: &[f64],
+    nz: usize,
+    ny: usize,
+    nx: usize,
+    sigma: f64,
+    spacing: Option<&[f64]>,
+    use_normalized_derivatives: bool,
+) -> (Vec<f64>, Vec<f64>) {
+    if data.is_empty() || sigma <= 0.0 {
+        return (data.to_vec(), vec![]);
+    }
+    let sp: [f64; 3] = match spacing {
+        Some(s) if s.len() >= 3 => [s[0], s[1], s[2]],
+        _ => [1.0, 1.0, 1.0],
+    };
+    let sigma_px = [sigma / sp[0], sigma / sp[1], sigma / sp[2]];
+    let truncate = 3.0;
+
+    let make_1d = |s: f64| -> (Vec<f64>, Vec<f64>) {
+        let w = (truncate * s).ceil() as usize;
+        let size = 2 * w + 1;
+        let mut g = vec![0.0f64; size];
+        let mut log1d = vec![0.0f64; size];
+        let s2 = s * s;
+        for i in 0..size {
+            let x = i as f64 - w as f64;
+            let gv = (-0.5 * x * x / s2).exp();
+            g[i] = gv;
+            log1d[i] = (x * x / s2 - 1.0) / s2 * gv;
+        }
+        let gsum: f64 = g.iter().sum();
+        g.iter_mut().for_each(|v| *v /= gsum);
+        let logsum: f64 = log1d.iter().sum();
+        log1d.iter_mut().for_each(|v| *v -= logsum / size as f64);
+        log1d.iter_mut().for_each(|v| *v /= gsum);
+        (g, log1d)
+    };
+
+    let (gz, logz) = make_1d(sigma_px[0]);
+    let (gy, logy) = make_1d(sigma_px[1]);
+    let (gx, logx) = make_1d(sigma_px[2]);
+    let wz = gz.len();
+    let wy = gy.len();
+    let wx = gx.len();
+
+    let build_k = |kz: &[f64], ky: &[f64], kx: &[f64]| -> Vec<f64> {
+        let mut k = vec![0.0f64; wz * wy * wx];
+        for iz in 0..wz {
+            for iy in 0..wy {
+                for ix in 0..wx {
+                    k[iz * wy * wx + iy * wx + ix] = kz[iz] * ky[iy] * kx[ix];
+                }
+            }
+        }
+        k
+    };
+    let k1 = build_k(&logz, &gy, &gx);
+    let k2 = build_k(&gz, &logy, &gx);
+    let k3 = build_k(&gz, &gy, &logx);
+    let mut kernel = vec![0.0f64; wz * wy * wx];
+    for i in 0..kernel.len() {
+        kernel[i] = k1[i] + k2[i] + k3[i];
+    }
+
+    let result = convn_fft(data, &[nz, ny, nx], &kernel, &[wz, wy, wx], "same")
+        .map(|(d, _)| d)
+        .unwrap_or_else(|_| data.to_vec());
+
+    let response = if use_normalized_derivatives {
+        result.iter().map(|&v| v * sigma * sigma).collect()
+    } else {
+        result
+    };
+    (response, kernel)
+}
+
+// ---------------------------------------------------------------------------
+// B-spline value interpolation
+// ---------------------------------------------------------------------------
+
+/// Interpolate values at arbitrary positions using a B-spline basis.
+///
+/// Supports degree 1 (linear), 2 (quadratic), and 3 (cubic, default).
+/// `coeffs` should already be the B-spline coefficient array produced by
+/// [`compute_bspline_coefficients`], not the raw signal.
+///
+/// # Arguments
+/// * `xi`             — Query coordinates (0-based).
+/// * `coeffs`         — 1-D spline coefficients.
+/// * `degree`         — Spline degree: 1, 2, or 3.
+/// * `mirror_boundary`— `true` → mirror/symmetric BC; `false` → periodic BC.
+///
+/// # Returns
+/// Interpolated values at each coordinate in `xi`.
+pub fn interp_bspline_value(
+    xi: &[f64],
+    coeffs: &[f64],
+    degree: u8,
+    mirror_boundary: bool,
+) -> Vec<f64> {
+    let n = coeffs.len();
+    if n == 0 || xi.is_empty() {
+        return vec![0.0; xi.len()];
+    }
+
+    let mir = |i: isize| -> usize {
+        let mut idx = i;
+        if idx < 0 { idx = -idx; }
+        if idx >= n as isize { idx = 2 * n as isize - idx - 2; }
+        idx.clamp(0, n as isize - 1) as usize
+    };
+    let per = |i: isize| -> usize {
+        ((i % n as isize + n as isize) % n as isize) as usize
+    };
+    let idx = |i: isize| if mirror_boundary { mir(i) } else { per(i) };
+
+    xi.iter().map(|&x| {
+        let xi_i = x.floor() as isize;
+        let dx = x - xi_i as f64;
+        match degree {
+            1 => {
+                // Linear interpolation.
+                dx * coeffs[idx(xi_i + 1)] + (1.0 - dx) * coeffs[idx(xi_i)]
+            }
+            2 => {
+                // Quadratic B-spline (4-tap).
+                let w: [f64; 4] = if dx <= 0.5 {
+                    let w0 = (dx - 0.5) * (dx - 0.5) / 2.0;
+                    let w1 = 0.75 - dx * dx;
+                    [w0, w1, 1.0 - w0 - w1, 0.0]
+                } else {
+                    let w1 = (dx - 1.5) * (dx - 1.5) / 2.0;
+                    let w3 = (dx - 0.5) * (dx - 0.5) / 2.0;
+                    [0.0, w1, 1.0 - w3 - w1, w3]
+                };
+                [-1isize, 0, 1, 2]
+                    .iter()
+                    .zip(w.iter())
+                    .map(|(&k, &wk)| wk * coeffs[idx(xi_i + k)])
+                    .sum()
+            }
+            _ => {
+                // Cubic B-spline (degree 3, default).
+                let t1 = 1.0 - dx;
+                let t2 = dx * dx;
+                let w0 = (t1 * t1 * t1) / 6.0;
+                let w1 = (2.0 / 3.0) + 0.5 * t2 * (dx - 2.0);
+                let w3 = (t2 * dx) / 6.0;
+                let w2 = 1.0 - w3 - w1 - w0;
+                let w = [w0, w1, w2, w3];
+                [-1isize, 0, 1, 2]
+                    .iter()
+                    .zip(w.iter())
+                    .map(|(&k, &wk)| wk * coeffs[idx(xi_i + k)])
+                    .sum()
+            }
+        }
+    }).collect()
+}
+
+// ---------------------------------------------------------------------------
+// Spline local maxima (1-D)
+// ---------------------------------------------------------------------------
+
+/// Find local maxima of a 1-D cubic spline interpolant.
+///
+/// Computes cubic B-spline coefficients for `data`, then analytically solves
+/// for `t ∈ [0, 1]` where the spline derivative is zero in each unit interval
+/// `[i, i+1]`.
+///
+/// # Arguments
+/// * `data`    — Input 1-D signal.
+/// * `lambda_` — Smoothness penalty (0.0 = exact interpolation).
+///
+/// # Returns
+/// `(fmax, xmax, coeffs)`:
+/// * `fmax`   — Spline values at each located maximum.
+/// * `xmax`   — Fractional 0-based indices of the maxima.
+/// * `coeffs` — B-spline coefficients of `data`.
+pub fn calc_interp_maxima_1d(data: &[f64], lambda_: f64) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    let nx = data.len();
+    if nx < 2 {
+        return (vec![], vec![], data.to_vec());
+    }
+
+    let coeffs = match compute_bspline_coefficients(data, lambda_, 3, "fourier", "symmetric") {
+        Ok(c) => c,
+        Err(_) => return (vec![], vec![], data.to_vec()),
+    };
+
+    // Mirror-extend: cx = [c[1], c[0..n], c[n-2]]
+    let mut cx = Vec::with_capacity(nx + 2);
+    cx.push(coeffs[1]);
+    cx.extend_from_slice(&coeffs);
+    cx.push(coeffs[nx - 2]);
+
+    // Threshold for treating a quadratic coefficient as linear/degenerate.
+    const DERIV_TOL: f64 = 1e-10;
+
+    let mut xmax: Vec<f64> = Vec::new();
+    for i in 0..nx - 1 {
+        let c = &cx[i..i + 4];
+        // Derivative of the cubic B-spline sum: a·t² + b·t + c_coef = 0
+        let a = -0.5 * c[0] + 1.5 * c[1] - 1.5 * c[2] + 0.5 * c[3];
+        let b = c[0] - 2.0 * c[1] + c[2];
+        let c_coef = -0.5 * c[0] + 0.5 * c[2];
+
+        if a.abs() < DERIV_TOL {
+            if b.abs() > DERIV_TOL {
+                let t = -c_coef / b;
+                if (0.0..=1.0).contains(&t) {
+                    xmax.push(i as f64 + t);
+                }
+            }
+        } else {
+            let disc = b * b - 4.0 * a * c_coef;
+            if disc >= 0.0 {
+                let sq = disc.sqrt();
+                let t1 = (-b + sq) / (2.0 * a);
+                let t2 = (-b - sq) / (2.0 * a);
+                if (0.0..=1.0).contains(&t1) {
+                    xmax.push(i as f64 + t1);
+                }
+                if (0.0..=1.0).contains(&t2) && (t2 - t1).abs() > DERIV_TOL {
+                    xmax.push(i as f64 + t2);
+                }
+            }
+        }
+    }
+
+    let fmax = interp_bspline_value(&xmax, &coeffs, 3, true);
+    (fmax, xmax, coeffs)
+}
+
+// ---------------------------------------------------------------------------
+// Photobleach correction with fit diagnostics
+// ---------------------------------------------------------------------------
+
+/// Correct photobleaching and return fit diagnostics.
+///
+/// Identical to the correction performed by [`photobleach_correction`] but
+/// additionally returns the fitted decay curve, per-frame mean intensities,
+/// and the R² goodness-of-fit statistic.
+///
+/// # Arguments
+/// * `data`   — Flat array of shape `n × frames` (frames vary slowest).
+/// * `n`      — Number of pixels per frame.
+/// * `frames` — Number of time frames.
+/// * `masks`  — Flat mask (same shape); pixels where `mask > 0` are used.
+///              Pass an empty slice to use all non-zero pixels.
+///
+/// # Returns
+/// `(corrected, fitted_curve, mean_intensities, r_squared)`.
+pub fn photobleach_correction_with_fit(
+    data: &[f64],
+    n: usize,
+    frames: usize,
+    masks: &[f64],
+) -> (Vec<f64>, Vec<f64>, Vec<f64>, f64) {
+    if data.len() != n * frames || frames == 0 || n == 0 {
+        return (data.to_vec(), vec![], vec![], 0.0);
+    }
+
+    let use_mask = masks.len() == n * frames;
+
+    let means: Vec<f64> = (0..frames)
+        .map(|f| {
+            let d = &data[f * n..(f + 1) * n];
+            let m = if use_mask { &masks[f * n..(f + 1) * n] } else { &[][..] };
+            let (s, c) = if use_mask {
+                d.iter()
+                    .zip(m.iter())
+                    .filter(|(_, &mk)| mk > 0.0)
+                    .fold((0.0, 0usize), |(s, c), (&v, _)| (s + v, c + 1))
+            } else {
+                d.iter()
+                    .filter(|&&v| v != 0.0)
+                    .fold((0.0, 0usize), |(s, c), &v| (s + v, c + 1))
+            };
+            if c > 0 { s / c as f64 } else { 0.0 }
+        })
+        .collect();
+
+    // Log-linear regression to estimate single-exponential a·exp(b·t).
+    let m0 = means.iter().cloned().fold(f64::INFINITY, f64::min).max(1e-12);
+    let log_means: Vec<f64> = means.iter().map(|&m| m.max(m0).ln()).collect();
+    let t_vals: Vec<f64> = (0..frames).map(|i| i as f64).collect();
+
+    let (ta, tb) = {
+        let nf = frames as f64;
+        let sx: f64 = t_vals.iter().sum();
+        let sy: f64 = log_means.iter().sum();
+        let sxy: f64 = t_vals.iter().zip(log_means.iter()).map(|(x, y)| x * y).sum();
+        let sx2: f64 = t_vals.iter().map(|x| x * x).sum();
+        let denom = nf * sx2 - sx * sx;
+        if denom.abs() < 1e-10 {
+            (sy / nf, 0.0)
+        } else {
+            let b = (nf * sxy - sx * sy) / denom;
+            let a = (sy - b * sx) / nf;
+            (a, b)
+        }
+    };
+
+    let fitted_curve: Vec<f64> = (0..frames)
+        .map(|f| (ta + tb * f as f64).exp().max(1e-12))
+        .collect();
+
+    let mean_of_means = means.iter().sum::<f64>() / frames as f64;
+    let ss_res: f64 = means
+        .iter()
+        .zip(fitted_curve.iter())
+        .map(|(m, fc)| (m - fc).powi(2))
+        .sum();
+    let ss_tot: f64 = means.iter().map(|m| (m - mean_of_means).powi(2)).sum();
+    let r_squared = if ss_tot > 1e-12 {
+        (1.0 - ss_res / ss_tot).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+
+    // Apply per-frame correction factor so the fitted curve becomes constant.
+    let baseline = means[0].max(1e-12);
+    let mut corrected = data.to_vec();
+    for f in 0..frames {
+        let scale = baseline / fitted_curve[f];
+        for v in corrected[f * n..(f + 1) * n].iter_mut() {
+            *v *= scale;
+        }
+    }
+
+    (corrected, fitted_curve, means, r_squared)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4478,4 +4826,134 @@ mod tests {
         let s = skeleton(&[], 0, 0, 0, "t", -1.0);
         assert!(s.is_empty());
     }
+
+    // --- filter_log_nd_with_kernel ---
+
+    #[test]
+    fn test_filter_log_nd_with_kernel_shape() {
+        let data = vec![1.0f64; 4 * 4 * 4];
+        let (response, kernel) = filter_log_nd_with_kernel(&data, 4, 4, 4, 1.0, None, false);
+        assert_eq!(response.len(), data.len());
+        assert!(!kernel.is_empty());
+    }
+
+    #[test]
+    fn test_filter_log_nd_with_kernel_matches_filter_log_nd() {
+        let data: Vec<f64> = (0..27).map(|i| i as f64).collect();
+        let (resp1, _k) = filter_log_nd_with_kernel(&data, 3, 3, 3, 1.0, None, false);
+        let resp2 = filter_log_nd(&data, 3, 3, 3, 1.0, None, false);
+        assert_eq!(resp1.len(), resp2.len());
+        for (a, b) in resp1.iter().zip(resp2.iter()) {
+            assert!((a - b).abs() < 1e-9, "filter_log_nd_with_kernel diverges from filter_log_nd");
+        }
+    }
+
+    #[test]
+    fn test_filter_log_nd_with_kernel_normalized() {
+        let data = vec![1.0f64; 8];
+        let sigma = 1.5;
+        let (r1, _) = filter_log_nd_with_kernel(&data, 2, 2, 2, sigma, None, false);
+        let (r2, _) = filter_log_nd_with_kernel(&data, 2, 2, 2, sigma, None, true);
+        // Normalized response ≈ unnormalized × sigma²
+        for (a, b) in r2.iter().zip(r1.iter()) {
+            assert!((a - b * sigma * sigma).abs() < 1e-6, "normalized scale mismatch");
+        }
+    }
+
+    // --- interp_bspline_value ---
+
+    #[test]
+    fn test_interp_bspline_value_at_integers() {
+        // Verify interp_bspline_value matches binterp_1d (same coefficients, same formula).
+        let data = vec![1.0, 3.0, 2.0, 5.0, 4.0];
+        let coeffs = b3spline_1d(&data, 1, data.len(), "mirror").unwrap();
+        let xi: Vec<f64> = (0..data.len()).map(|i| i as f64).collect();
+        // Reference: binterp_1d computes coefficients internally with b3spline_1d.
+        let (ref_vals, _, _) = binterp_1d(&data, &xi, true);
+        let vals = interp_bspline_value(&xi, &coeffs, 3, true);
+        for (v, r) in vals.iter().zip(ref_vals.iter()) {
+            assert!(
+                (v - r).abs() < 1e-9,
+                "interp_bspline_value diverges from binterp_1d: got {v}, expected {r}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_interp_bspline_value_linear_degree() {
+        let coeffs = vec![0.0, 1.0, 2.0, 3.0];
+        let xi = vec![1.5];
+        let vals = interp_bspline_value(&xi, &coeffs, 1, true);
+        // Linear interpolation between 1.0 and 2.0 at t=0.5
+        assert!((vals[0] - 1.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_interp_bspline_value_empty() {
+        let vals = interp_bspline_value(&[], &[1.0, 2.0], 3, true);
+        assert!(vals.is_empty());
+    }
+
+    // --- calc_interp_maxima_1d ---
+
+    #[test]
+    fn test_calc_interp_maxima_1d_coeffs_length() {
+        let data = vec![0.0, 1.0, 2.0, 1.0, 0.0];
+        let (fmax, xmax, coeffs) = calc_interp_maxima_1d(&data, 0.0);
+        assert_eq!(coeffs.len(), data.len());
+        assert_eq!(fmax.len(), xmax.len());
+    }
+
+    #[test]
+    fn test_calc_interp_maxima_1d_finds_peak() {
+        // A parabola-like signal with peak at index 2
+        let data = vec![0.0, 1.0, 2.0, 1.0, 0.0];
+        let (_fmax, xmax, _c) = calc_interp_maxima_1d(&data, 0.0);
+        // At least one maximum should be near index 2
+        let near_peak = xmax.iter().any(|&x| (x - 2.0).abs() < 0.5);
+        assert!(near_peak, "expected maximum near index 2, got {:?}", xmax);
+    }
+
+    #[test]
+    fn test_calc_interp_maxima_1d_short_signal() {
+        let (fmax, xmax, _c) = calc_interp_maxima_1d(&[5.0], 0.0);
+        assert!(fmax.is_empty());
+        assert!(xmax.is_empty());
+    }
+
+    // --- photobleach_correction_with_fit ---
+
+    #[test]
+    fn test_photobleach_correction_with_fit_shape() {
+        let n = 4usize;
+        let frames = 5usize;
+        let data: Vec<f64> = (0..n * frames).map(|i| (i + 1) as f64).collect();
+        let (corrected, fitted, means, r2) = photobleach_correction_with_fit(&data, n, frames, &[]);
+        assert_eq!(corrected.len(), data.len());
+        assert_eq!(fitted.len(), frames);
+        assert_eq!(means.len(), frames);
+        assert!((0.0..=1.0).contains(&r2));
+    }
+
+    #[test]
+    fn test_photobleach_correction_with_fit_constant() {
+        // Constant signal → no correction, R² = 0.
+        let n = 10usize;
+        let frames = 5usize;
+        let data = vec![2.0f64; n * frames];
+        let (corrected, _fitted, _means, _r2) =
+            photobleach_correction_with_fit(&data, n, frames, &[]);
+        for &v in &corrected {
+            assert!((v - 2.0).abs() < 1e-6, "constant data should be unchanged after correction");
+        }
+    }
+
+    #[test]
+    fn test_photobleach_correction_with_fit_bad_dims() {
+        let (corrected, fitted, means, _r2) = photobleach_correction_with_fit(&[1.0, 2.0], 3, 5, &[]);
+        assert_eq!(corrected, vec![1.0, 2.0]); // returned unchanged
+        assert!(fitted.is_empty());
+        assert!(means.is_empty());
+    }
 }
+

@@ -2387,6 +2387,345 @@ pub fn rotate_psf(
     out
 }
 
+// ---------------------------------------------------------------------------
+// 4-D indexed array assignment
+// ---------------------------------------------------------------------------
+
+/// Assign a 4-D region into a flat array at the position specified by a
+/// MATLAB-style bounding box.
+///
+/// The bounding box uses 1-based indexing (`bbox[k]` is the *start* index
+/// and `bbox[k+4]` is the *inclusive end* index in dimension `k`, matching
+/// MATLAB semantics).  The equivalent Python/NumPy slice is
+/// `arr[s-1 : e, ...]` where `s = bbox[k]` and `e = bbox[k+4]`.
+///
+/// # Arguments
+/// * `array`       — Mutable flat target array in `[d0, d1, d2, d3]` row-major order.
+/// * `dims`        — Dimensions of `array` `[d0, d1, d2, d3]`.
+/// * `bbox`        — 8-element 1-based bounding box
+///                   `[y_s, x_s, z_s, t_s, y_e, x_e, z_e, t_e]`.
+/// * `region`      — Flat source region to insert.
+/// * `region_dims` — Dimensions of `region` `[rd0, rd1, rd2, rd3]`.
+/// * `region_bbox` — Optional 8-element 1-based crop applied to `region`
+///                   before insertion.  `None` inserts the entire `region`.
+pub fn indexing_4d(
+    array: &mut [f64],
+    dims: &[usize; 4],
+    bbox: &[usize; 8],
+    region: &[f64],
+    region_dims: &[usize; 4],
+    region_bbox: Option<&[usize; 8]>,
+) {
+    let [d0, d1, d2, d3] = *dims;
+    let [rd0, rd1, rd2, rd3] = *region_dims;
+
+    // Convert 1-based MATLAB bbox to 0-based start / exclusive end.
+    let ys = bbox[0].saturating_sub(1);
+    let xs = bbox[1].saturating_sub(1);
+    let zs = bbox[2].saturating_sub(1);
+    let ts = bbox[3].saturating_sub(1);
+    let ye = bbox[4]; // Python slice: arr[ys:ye]
+    let xe = bbox[5];
+    let ze = bbox[6];
+    let te = bbox[7];
+
+    let (rys, rxs, rzs, rts, rye, rxe, rze, rte) = match region_bbox {
+        Some(rb) => (
+            rb[0].saturating_sub(1),
+            rb[1].saturating_sub(1),
+            rb[2].saturating_sub(1),
+            rb[3].saturating_sub(1),
+            rb[4],
+            rb[5],
+            rb[6],
+            rb[7],
+        ),
+        None => (0, 0, 0, 0, rd0, rd1, rd2, rd3),
+    };
+
+    for (ai, ri) in (ys..ye.min(d0)).zip(rys..rye.min(rd0)) {
+        for (aj, rj) in (xs..xe.min(d1)).zip(rxs..rxe.min(rd1)) {
+            for (ak, rk) in (zs..ze.min(d2)).zip(rzs..rze.min(rd2)) {
+                for (al, rl) in (ts..te.min(d3)).zip(rts..rte.min(rd3)) {
+                    let a_idx = ai * d1 * d2 * d3 + aj * d2 * d3 + ak * d3 + al;
+                    let r_idx = ri * rd1 * rd2 * rd3 + rj * rd2 * rd3 + rk * rd3 + rl;
+                    if a_idx < array.len() && r_idx < region.len() {
+                        array[a_idx] = region[r_idx];
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Write data block to a Zarr-style chunked array
+// ---------------------------------------------------------------------------
+
+/// Write a block of data into a flat array using Zarr chunk-coordinate addressing.
+///
+/// Computes the target slice from the 1-based block subscripts and the chunk
+/// shape, then copies data.  If `trim_edge` is `true` and the block extends
+/// beyond the array boundary the data is trimmed before writing.
+///
+/// # Arguments
+/// * `array`       — Mutable flat target array in `[d0, d1, d2]` row-major order.
+/// * `array_shape` — Shape of `array` `[nz, ny, nx]`.
+/// * `chunk_shape` — Chunk dimensions `[cz, cy, cx]`.
+/// * `block_sub`   — 1-based block subscripts `[bz, by, bx]`.
+/// * `data`        — Block data to write (must equal the chunk size unless trimming).
+/// * `trim_edge`   — When `true`, trim `data` if the block extends beyond the array.
+pub fn write_zarr_block(
+    array: &mut [f64],
+    array_shape: &[usize; 3],
+    chunk_shape: &[usize; 3],
+    block_sub: &[usize; 3],
+    data: &[f64],
+    trim_edge: bool,
+) {
+    let [az, ay, ax] = *array_shape;
+    let [cz, cy, cx] = *chunk_shape;
+    let [bz, by, bx] = *block_sub;
+
+    // Convert 1-based block subscripts to 0-based start indices.
+    let sz = (bz.saturating_sub(1)) * cz;
+    let sy = (by.saturating_sub(1)) * cy;
+    let sx = (bx.saturating_sub(1)) * cx;
+
+    // Determine actual write extents, trimming at array boundary if requested.
+    let ez = if trim_edge { (sz + cz).min(az) } else { sz + cz };
+    let ey = if trim_edge { (sy + cy).min(ay) } else { sy + cy };
+    let ex = if trim_edge { (sx + cx).min(ax) } else { sx + cx };
+
+    let dz = ez.saturating_sub(sz);
+    let dy = ey.saturating_sub(sy);
+    let dx = ex.saturating_sub(sx);
+
+    for iz in 0..dz {
+        for iy in 0..dy {
+            for ix in 0..dx {
+                let arr_idx = (sz + iz) * ay * ax + (sy + iy) * ax + (sx + ix);
+                let dat_idx = iz * cy * cx + iy * cx + ix;
+                if arr_idx < array.len() && dat_idx < data.len() {
+                    array[arr_idx] = data[dat_idx];
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Full deskew workflow
+// ---------------------------------------------------------------------------
+
+/// Result returned by [`deskew_data`].
+#[derive(Debug, Clone)]
+pub struct DeskewResult {
+    /// Number of input files processed.
+    pub n_files: usize,
+    /// Output directory path.
+    pub output_dir: String,
+    /// Paths to saved deskewed TIFF files (empty if `save_deskew` is `false`).
+    pub deskewed_files: Vec<String>,
+    /// Paths to saved rotated TIFF files (empty if `save_rotate` is `false`).
+    pub rotated_files: Vec<String>,
+}
+
+/// Complete deskewing workflow for light-sheet microscopy data.
+///
+/// Orchestrates the full pipeline for each input file:
+/// 1. Read TIFF.
+/// 2. Apply sCMOS camera flip (`flip_mode`).
+/// 3. Optionally apply flat-field correction.
+/// 4. Optionally crop to `bbox` (`[z1, z2, y1, y2, x1, x2]`).
+/// 5. Deskew using [`deskew_frame_3d`].
+/// 6. Optionally rotate using [`rotate_frame_3d`].
+/// 7. Write results as TIFF files in `output_dir`.
+///
+/// # Arguments
+/// * `input_paths`      — Paths to input TIFF files.
+/// * `output_dir`       — Directory for output files.
+/// * `dz`               — Z step size in microns.
+/// * `angle`            — Skew angle in degrees.
+/// * `pixel_size`       — XY pixel size in microns.
+/// * `reverse`          — Reverse scan direction.
+/// * `rotate`           — Also produce rotated output.
+/// * `flip_mode`        — Camera flip mode: `"none"`, `"horizontal"`, `"vertical"`, `"both"`.
+/// * `flat_field_path`  — Optional path to flat-field correction TIFF.
+/// * `save_deskew`      — Whether to save deskewed volumes.
+/// * `save_rotate`      — Whether to save rotated volumes.
+/// * `bbox`             — Optional `[z1, z2, y1, y2, x1, x2]` crop (0-based, exclusive end).
+/// * `overwrite`        — Whether to overwrite existing output files.
+/// * `ny/nx/nz`         — Dimensions of each input volume.  These are required because
+///                        the raw TIFF bytes are decoded as f32 samples.
+pub fn deskew_data(
+    input_paths: &[&str],
+    output_dir: &str,
+    dz: f64,
+    angle: f64,
+    pixel_size: f64,
+    reverse: bool,
+    rotate: bool,
+    flip_mode: &str,
+    flat_field_path: Option<&str>,
+    save_deskew: bool,
+    save_rotate: bool,
+    bbox: Option<[usize; 6]>,
+    overwrite: bool,
+    ny: usize,
+    nx: usize,
+    nz: usize,
+) -> DeskewResult {
+    use std::path::Path;
+
+    // Attempt to create the output directory; if it fails, return early with an empty result.
+    if std::fs::create_dir_all(output_dir).is_err() {
+        return DeskewResult {
+            n_files: input_paths.len(),
+            output_dir: output_dir.to_string(),
+            deskewed_files: Vec::new(),
+            rotated_files: Vec::new(),
+        };
+    }
+
+    // Load flat field once if provided.
+    let flat_field: Option<Vec<f64>> = flat_field_path.and_then(|p| {
+        crate::io::read_tiff(p, None).ok().map(|bytes| {
+            bytes.chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64)
+                .collect()
+        })
+    });
+
+    let mut result = DeskewResult {
+        n_files: input_paths.len(),
+        output_dir: output_dir.to_string(),
+        deskewed_files: Vec::new(),
+        rotated_files: Vec::new(),
+    };
+
+    for &input_path in input_paths {
+        let stem = Path::new(input_path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("output");
+
+        let deskew_out = format!("{}/{}_deskewed.tif", output_dir, stem);
+        let rotate_out = format!("{}/{}_rotated.tif", output_dir, stem);
+
+        // Skip if output already exists and overwrite is disabled.
+        if !overwrite
+            && save_deskew
+            && Path::new(&deskew_out).exists()
+        {
+            result.deskewed_files.push(deskew_out.clone());
+            if save_rotate && Path::new(&rotate_out).exists() {
+                result.rotated_files.push(rotate_out);
+            }
+            continue;
+        }
+
+        // Read raw bytes and decode as f32 samples.
+        let bytes = match crate::io::read_tiff(input_path, None) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let mut data: Vec<f64> = bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64)
+            .collect();
+        let mut dims = [nz, ny, nx];
+
+        // Camera flip.
+        data = scmos_camera_flip(&data, dims[0], dims[1], dims[2], flip_mode);
+
+        // Flat-field correction.
+        if let Some(ref ff) = flat_field {
+            let empty_bg = vec![0.0f64; ny * nx];
+            data = process_flatfield_correction_frame(
+                &data, ny, nx,
+                ff, ny, nx,
+                &empty_bg, ny, nx,
+                None,
+                0.05,
+            );
+        }
+
+        // Bounding-box crop.
+        if let Some([z1, z2, y1, y2, x1, x2]) = bbox {
+            let cropped_nz = z2.saturating_sub(z1);
+            let cropped_ny = y2.saturating_sub(y1);
+            let cropped_nx = x2.saturating_sub(x1);
+            let mut cropped = vec![0.0f64; cropped_nz * cropped_ny * cropped_nx];
+            for iz in z1..z2.min(dims[0]) {
+                for iy in y1..y2.min(dims[1]) {
+                    for ix in x1..x2.min(dims[2]) {
+                        let src = iz * dims[1] * dims[2] + iy * dims[2] + ix;
+                        let dst = (iz - z1) * cropped_ny * cropped_nx
+                            + (iy - y1) * cropped_nx
+                            + (ix - x1);
+                        if src < data.len() && dst < cropped.len() {
+                            cropped[dst] = data[src];
+                        }
+                    }
+                }
+            }
+            data = cropped;
+            dims = [cropped_nz, cropped_ny, cropped_nx];
+        }
+
+        // Deskew.
+        let (deskewed, deskew_dims) = match deskew_frame_3d(&data, &dims, dz, angle, pixel_size, reverse) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+
+        // Save deskewed volume.
+        if save_deskew {
+            let out_ny = deskew_dims.get(1).copied().unwrap_or(ny);
+            let out_nx = deskew_dims.get(2).copied().unwrap_or(nx);
+            let bytes_out: Vec<u8> = deskewed
+                .iter()
+                .flat_map(|&v| (v as f32).to_le_bytes())
+                .collect();
+            if crate::io::write_tiff(&deskew_out, &bytes_out, out_nx, out_ny, 32, "none").is_ok() {
+                result.deskewed_files.push(deskew_out.clone());
+            }
+        }
+
+        // Optionally rotate.
+        if rotate {
+            let rotated_result = rotate_frame_3d(
+                &deskewed,
+                &deskew_dims,
+                angle,
+                dz,
+                pixel_size,
+                reverse,
+                true,
+                false,
+            );
+            if let Ok((rotated, rot_dims)) = rotated_result {
+                if save_rotate {
+                    let rot_ny = rot_dims.get(1).copied().unwrap_or(ny);
+                    let rot_nx = rot_dims.get(2).copied().unwrap_or(nx);
+                    let bytes_rot: Vec<u8> = rotated
+                        .iter()
+                        .flat_map(|&v| (v as f32).to_le_bytes())
+                        .collect();
+                    if crate::io::write_tiff(&rotate_out, &bytes_rot, rot_nx, rot_ny, 32, "none")
+                        .is_ok()
+                    {
+                        result.rotated_files.push(rotate_out);
+                    }
+                }
+            }
+        }
+    }
+
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2967,5 +3306,111 @@ mod tests {
     fn test_rotate_psf_empty() {
         let out = rotate_psf(&[], 0, 0, 0, 32.45, 0.108, 0.1, false, false);
         assert!(out.is_empty());
+    }
+
+    // --- indexing_4d ---
+
+    #[test]
+    fn test_indexing_4d_full_insert() {
+        // Insert a 2×2×2×2 region into a 4×4×4×4 array at MATLAB position (2,2,2,2).
+        let mut array = vec![0.0f64; 4 * 4 * 4 * 4];
+        let region = vec![1.0f64; 2 * 2 * 2 * 2];
+        indexing_4d(
+            &mut array,
+            &[4, 4, 4, 4],
+            &[2, 2, 2, 2, 3, 3, 3, 3], // 1-based, inclusive end
+            &region,
+            &[2, 2, 2, 2],
+            None,
+        );
+        let idx = 1 * 4 * 4 * 4 + 1 * 4 * 4 + 1 * 4 + 1;
+        assert!((array[idx] - 1.0).abs() < 1e-9, "inserted value should be 1.0");
+    }
+
+    #[test]
+    fn test_indexing_4d_with_region_bbox() {
+        let mut array = vec![0.0f64; 8 * 8 * 8 * 8];
+        let region = vec![2.0f64; 4 * 4 * 4 * 4];
+        // Use only the first 2×2×2×2 of the region.
+        indexing_4d(
+            &mut array,
+            &[8, 8, 8, 8],
+            &[1, 1, 1, 1, 2, 2, 2, 2],
+            &region,
+            &[4, 4, 4, 4],
+            Some(&[1, 1, 1, 1, 2, 2, 2, 2]),
+        );
+        assert!((array[0] - 2.0).abs() < 1e-9);
+    }
+
+    // --- write_zarr_block ---
+
+    #[test]
+    fn test_write_zarr_block_basic() {
+        // A 4×4×4 array filled with zeros; write a 2×2×2 block at (1,1,1).
+        let mut array = vec![0.0f64; 4 * 4 * 4];
+        let block = vec![7.0f64; 2 * 2 * 2];
+        write_zarr_block(&mut array, &[4, 4, 4], &[2, 2, 2], &[1, 1, 1], &block, false);
+        // Block (1,1,1) writes to z=0..2, y=0..2, x=0..2 → index 0.
+        assert!((array[0] - 7.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_write_zarr_block_second_block() {
+        // Block (2,1,1) writes to z=2..4, y=0..2, x=0..2.
+        let mut array = vec![0.0f64; 4 * 4 * 4];
+        let block = vec![5.0f64; 2 * 2 * 2];
+        write_zarr_block(&mut array, &[4, 4, 4], &[2, 2, 2], &[2, 1, 1], &block, false);
+        // z=2, y=0, x=0 → index 2*4*4 = 32
+        assert!((array[32] - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_write_zarr_block_trim_edge() {
+        // Block at (2,2,2) extends past a 3×3×3 array; trim_edge should prevent OOB.
+        let mut array = vec![0.0f64; 3 * 3 * 3];
+        let block = vec![3.0f64; 2 * 2 * 2];
+        write_zarr_block(&mut array, &[3, 3, 3], &[2, 2, 2], &[2, 2, 2], &block, true);
+        // Should not panic; just writes whatever fits.
+        assert_eq!(array.len(), 27);
+    }
+
+    // --- deskew_data (unit-level: no-op on non-existent paths) ---
+
+    #[test]
+    fn test_deskew_data_missing_input() {
+        // Input path that does not exist: result should have 0 output files.
+        let result = deskew_data(
+            &["/nonexistent/path.tif"],
+            "/tmp",
+            0.5,
+            32.45,
+            0.108,
+            false,
+            false,
+            "none",
+            None,
+            true,
+            false,
+            None,
+            true,
+            4,
+            4,
+            4,
+        );
+        assert_eq!(result.n_files, 1);
+        assert!(result.deskewed_files.is_empty());
+    }
+
+    #[test]
+    fn test_deskew_data_empty_input() {
+        let result = deskew_data(
+            &[],
+            "/tmp",
+            0.5, 32.45, 0.108, false, false, "none",
+            None, true, false, None, true, 4, 4, 4,
+        );
+        assert_eq!(result.n_files, 0);
+        assert!(result.deskewed_files.is_empty());
     }
 }
