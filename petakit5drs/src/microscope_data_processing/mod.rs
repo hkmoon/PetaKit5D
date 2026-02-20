@@ -806,6 +806,332 @@ pub fn rotate_frame_3d(
     Ok((rotated, vec![out_nz, out_ny, out_nx]))
 }
 
+// ---------------------------------------------------------------------------
+// Camera flip correction
+// ---------------------------------------------------------------------------
+
+/// Flip a 3-D volume for sCMOS camera orientation correction.
+///
+/// # Arguments
+/// * `data`        — Flat ZYX input, length `nz * ny * nx`.
+/// * `nz`, `ny`, `nx` — Volume dimensions.
+/// * `flip_mode`   — `"none"`, `"horizontal"` (flip X), `"vertical"` (flip Y), or `"both"`.
+///
+/// # Returns
+/// Flipped volume, same length as input. Returns a copy when `flip_mode == "none"`.
+pub fn scmos_camera_flip(
+    data: &[f64],
+    nz: usize,
+    ny: usize,
+    nx: usize,
+    flip_mode: &str,
+) -> Vec<f64> {
+    if flip_mode == "none" {
+        return data.to_vec();
+    }
+    let mut out = data.to_vec();
+    let flip_x = flip_mode == "horizontal" || flip_mode == "both";
+    let flip_y = flip_mode == "vertical" || flip_mode == "both";
+
+    let nynx = ny * nx;
+    for z in 0..nz {
+        for y in 0..ny {
+            let sy = if flip_y { ny - 1 - y } else { y };
+            for x in 0..nx {
+                let sx = if flip_x { nx - 1 - x } else { x };
+                out[z * nynx + sy * nx + sx] = data[z * nynx + y * nx + x];
+            }
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Max pooling
+// ---------------------------------------------------------------------------
+
+/// 3-D max pooling.
+///
+/// Reduces each spatial dimension by taking the maximum over non-overlapping
+/// blocks of size `pool_sz`. If a dimension is not divisible the volume is
+/// zero-padded before pooling.
+///
+/// # Arguments
+/// * `data`           — Flat ZYX input, length `nz * ny * nx`.
+/// * `nz`, `ny`, `nx` — Input dimensions.
+/// * `pool_sz`        — Pool size `[pz, py, px]`.
+///
+/// # Returns
+/// `(pooled_data, [out_nz, out_ny, out_nx])`.
+pub fn max_pooling_3d(
+    data: &[f64],
+    nz: usize,
+    ny: usize,
+    nx: usize,
+    pool_sz: &[usize],
+) -> Result<(Vec<f64>, Vec<usize>), MicroscopeProcessingError> {
+    if pool_sz.len() != 3 {
+        return Err(MicroscopeProcessingError::InvalidDimensions);
+    }
+    let (pz, py, px) = (pool_sz[0].max(1), pool_sz[1].max(1), pool_sz[2].max(1));
+
+    // Pad dimensions to be divisible by pool sizes
+    let padded_nz = ((nz + pz - 1) / pz) * pz;
+    let padded_ny = ((ny + py - 1) / py) * py;
+    let padded_nx = ((nx + px - 1) / px) * px;
+
+    // Build padded volume (zero-pad)
+    let mut padded = vec![f64::NEG_INFINITY; padded_nz * padded_ny * padded_nx];
+    for z in 0..nz {
+        for y in 0..ny {
+            for x in 0..nx {
+                padded[z * padded_ny * padded_nx + y * padded_nx + x] =
+                    data[z * ny * nx + y * nx + x];
+            }
+        }
+    }
+
+    let out_nz = padded_nz / pz;
+    let out_ny = padded_ny / py;
+    let out_nx = padded_nx / px;
+    let mut out = vec![f64::NEG_INFINITY; out_nz * out_ny * out_nx];
+
+    for oz in 0..out_nz {
+        for oy in 0..out_ny {
+            for ox in 0..out_nx {
+                let mut max_val = f64::NEG_INFINITY;
+                for dz in 0..pz {
+                    for dy in 0..py {
+                        for dx in 0..px {
+                            let iz = oz * pz + dz;
+                            let iy = oy * py + dy;
+                            let ix = ox * px + dx;
+                            let v = padded[iz * padded_ny * padded_nx + iy * padded_nx + ix];
+                            if v > max_val {
+                                max_val = v;
+                            }
+                        }
+                    }
+                }
+                // Replace −∞ (padding) with 0
+                out[oz * out_ny * out_nx + oy * out_nx + ox] =
+                    if max_val == f64::NEG_INFINITY { 0.0 } else { max_val };
+            }
+        }
+    }
+
+    Ok((out, vec![out_nz, out_ny, out_nx]))
+}
+
+// ---------------------------------------------------------------------------
+// Block-average downsampling
+// ---------------------------------------------------------------------------
+
+/// Downsample a 3-D volume by block-averaging.
+///
+/// Each output voxel is the mean of a `factor[0]×factor[1]×factor[2]` block
+/// from the (zero-padded) input.  The shape of `factor` must be exactly 3.
+///
+/// # Returns
+/// `(downsampled_data, [out_nz, out_ny, out_nx])`.
+pub fn imresize3_average(
+    data: &[f64],
+    nz: usize,
+    ny: usize,
+    nx: usize,
+    factor: &[usize],
+) -> Result<(Vec<f64>, Vec<usize>), MicroscopeProcessingError> {
+    if factor.len() != 3 {
+        return Err(MicroscopeProcessingError::InvalidDimensions);
+    }
+    let (fz, fy, fx) = (factor[0].max(1), factor[1].max(1), factor[2].max(1));
+
+    let padded_nz = ((nz + fz - 1) / fz) * fz;
+    let padded_ny = ((ny + fy - 1) / fy) * fy;
+    let padded_nx = ((nx + fx - 1) / fx) * fx;
+
+    let out_nz = padded_nz / fz;
+    let out_ny = padded_ny / fy;
+    let out_nx = padded_nx / fx;
+    let mut out = vec![0.0f64; out_nz * out_ny * out_nx];
+
+    // Number of valid (non-padded) voxels per output block
+    let block_fz = fz as f64;
+    let block_fy = fy as f64;
+    let block_fx = fx as f64;
+
+    for oz in 0..out_nz {
+        for oy in 0..out_ny {
+            for ox in 0..out_nx {
+                let mut sum = 0.0;
+                let mut count = 0.0;
+                for dz in 0..fz {
+                    let iz = oz * fz + dz;
+                    for dy in 0..fy {
+                        let iy = oy * fy + dy;
+                        for dx in 0..fx {
+                            let ix = ox * fx + dx;
+                            if iz < nz && iy < ny && ix < nx {
+                                sum += data[iz * ny * nx + iy * nx + ix];
+                                count += 1.0;
+                            }
+                        }
+                    }
+                }
+                let _ = (block_fz, block_fy, block_fx); // suppress unused warnings
+                out[oz * out_ny * out_nx + oy * out_nx + ox] =
+                    if count > 0.0 { sum / count } else { 0.0 };
+            }
+        }
+    }
+
+    Ok((out, vec![out_nz, out_ny, out_nx]))
+}
+
+// ---------------------------------------------------------------------------
+// Resample setting validation
+// ---------------------------------------------------------------------------
+
+/// Validate and compute resample factors for microscopy data.
+///
+/// # Arguments
+/// * `resample_type`  — `"isotropic"`, `"xy_isotropic"`, or `"given"`.
+/// * `resample`       — Required for `"given"`: 1, 2, or 3 values (X/Y/Z factors).
+/// * `objective_scan` — `true` for objective scan, `false` for stage scan.
+/// * `skew_angle`     — Skew angle in degrees.
+/// * `xy_pixel_size`  — XY pixel size in µm.
+/// * `dz`             — Z step size in µm.
+///
+/// # Returns
+/// `Ok(([rx, ry, rz], z_aniso))` — resample factors and Z anisotropy.
+pub fn check_resample_setting(
+    resample_type: &str,
+    resample: Option<&[f64]>,
+    objective_scan: bool,
+    skew_angle: f64,
+    xy_pixel_size: f64,
+    dz: f64,
+) -> Result<([f64; 3], f64), MicroscopeProcessingError> {
+    let angle_rad = skew_angle.to_radians();
+    let z_aniso = if objective_scan {
+        dz / xy_pixel_size
+    } else {
+        angle_rad.sin() * dz / xy_pixel_size
+    };
+
+    let factors: [f64; 3] = match resample_type {
+        "isotropic" => [1.0, 1.0, 1.0],
+        "xy_isotropic" => {
+            let zf = ((angle_rad.sin().powi(2) + z_aniso.powi(2) * angle_rad.cos().powi(2))
+                / (angle_rad.cos().powi(2) + z_aniso.powi(2) * angle_rad.sin().powi(2)))
+            .sqrt();
+            [1.0, 1.0, zf]
+        }
+        "given" => {
+            let rs = resample.ok_or(MicroscopeProcessingError::InvalidResampleParameters)?;
+            match rs.len() {
+                0 => return Err(MicroscopeProcessingError::InvalidResampleParameters),
+                1 => [rs[0], rs[0], rs[0]],
+                2 => [rs[0], rs[0], rs[1]],
+                _ => [rs[0], rs[1], rs[2]],
+            }
+        }
+        _ => return Err(MicroscopeProcessingError::UnsupportedOperation),
+    };
+
+    Ok((factors, z_aniso))
+}
+
+// ---------------------------------------------------------------------------
+// Memory estimation
+// ---------------------------------------------------------------------------
+
+/// Estimate computing memory required for a given set of pipeline steps.
+///
+/// A simplified port of `estimate_computing_memory` that returns the
+/// estimated per-process RAM (GB) and GPU memory (GB).
+///
+/// # Arguments
+/// * `im_size`        — Image dimensions `[nz, ny, nx]`.
+/// * `steps`          — Pipeline step names (e.g. `&["deskew", "rotate"]`).
+/// * `dtype_bytes`    — Bytes per voxel (e.g. 2 for uint16).
+/// * `gpu_mem_factor` — Multiplicative factor for GPU overhead (default ≈1.5).
+/// * `gpu_max_mem`    — GPU memory cap in GB (default 12.0).
+///
+/// # Returns
+/// `(cpu_mem_gb, gpu_mem_gb)`.
+pub fn estimate_computing_memory(
+    im_size: &[usize],
+    steps: &[&str],
+    dtype_bytes: usize,
+    gpu_mem_factor: f64,
+    gpu_max_mem: f64,
+) -> (f64, f64) {
+    if im_size.is_empty() {
+        return (0.0, 0.0);
+    }
+    let voxels: usize = im_size.iter().product();
+    let data_size_gb = voxels as f64 * dtype_bytes as f64 / 1e9;
+
+    // Base memory factor: assume ~4× input for typical steps
+    let base_factor = 4.0 + steps.len() as f64 * 0.5;
+    let cpu_mem_gb = data_size_gb * base_factor;
+    let gpu_mem_gb = (data_size_gb * gpu_mem_factor).min(gpu_max_mem);
+
+    (cpu_mem_gb, gpu_mem_gb)
+}
+
+// ---------------------------------------------------------------------------
+// 3-D integral image (prefix sums)
+// ---------------------------------------------------------------------------
+
+/// Compute the 3-D integral image (summed area table).
+///
+/// The output has shape `nz * ny * nx` and `out[z][y][x]` equals the sum of
+/// all input voxels with indices `(iz ≤ z, iy ≤ y, ix ≤ x)`.
+///
+/// # Arguments
+/// * `data`           — Flat ZYX input.
+/// * `nz`, `ny`, `nx` — Dimensions.
+///
+/// # Returns
+/// Integral image as flat ZYX vector.
+pub fn integral_image_3d(data: &[f64], nz: usize, ny: usize, nx: usize) -> Vec<f64> {
+    if data.is_empty() || nz == 0 || ny == 0 || nx == 0 {
+        return vec![];
+    }
+    let nynx = ny * nx;
+    let mut out = data.to_vec();
+
+    // Prefix sum along X
+    for z in 0..nz {
+        for y in 0..ny {
+            for x in 1..nx {
+                out[z * nynx + y * nx + x] += out[z * nynx + y * nx + x - 1];
+            }
+        }
+    }
+    // Prefix sum along Y
+    for z in 0..nz {
+        for y in 1..ny {
+            for x in 0..nx {
+                let prev = out[z * nynx + (y - 1) * nx + x];
+                out[z * nynx + y * nx + x] += prev;
+            }
+        }
+    }
+    // Prefix sum along Z
+    for z in 1..nz {
+        for y in 0..ny {
+            for x in 0..nx {
+                let prev = out[(z - 1) * nynx + y * nx + x];
+                out[z * nynx + y * nx + x] += prev;
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1003,5 +1329,134 @@ mod tests {
         assert!(
             rotate_frame_3d(&data, &[2, 2, 2], 32.45, 0.5, -1.0, false, true, true).is_err()
         );
+    }
+
+    // --- scmos_camera_flip ---
+
+    #[test]
+    fn test_scmos_camera_flip_none() {
+        let data: Vec<f64> = (0..27).map(|i| i as f64).collect();
+        let out = scmos_camera_flip(&data, 3, 3, 3, "none");
+        assert_eq!(out, data);
+    }
+
+    #[test]
+    fn test_scmos_camera_flip_horizontal_reverses_x() {
+        // 1×1×3 volume: [10, 20, 30]
+        let data = vec![10.0, 20.0, 30.0];
+        let out = scmos_camera_flip(&data, 1, 1, 3, "horizontal");
+        assert_eq!(out, vec![30.0, 20.0, 10.0]);
+    }
+
+    #[test]
+    fn test_scmos_camera_flip_vertical_reverses_y() {
+        // 1×3×1 volume: [10, 20, 30]
+        let data = vec![10.0, 20.0, 30.0];
+        let out = scmos_camera_flip(&data, 1, 3, 1, "vertical");
+        assert_eq!(out, vec![30.0, 20.0, 10.0]);
+    }
+
+    // --- max_pooling_3d ---
+
+    #[test]
+    fn test_max_pooling_3d_basic() {
+        // 4×4×4 volume of ones, pool 2×2×2 → 2×2×2
+        let data = vec![1.0f64; 64];
+        let (out, dims) = max_pooling_3d(&data, 4, 4, 4, &[2, 2, 2]).unwrap();
+        assert_eq!(dims, vec![2, 2, 2]);
+        assert_eq!(out.len(), 8);
+        assert!(out.iter().all(|&v| (v - 1.0).abs() < 1e-9));
+    }
+
+    #[test]
+    fn test_max_pooling_3d_takes_max() {
+        // 2×2×2 volume, one hot at corner
+        let mut data = vec![0.0f64; 8];
+        data[0] = 5.0; // z=0,y=0,x=0
+        let (out, dims) = max_pooling_3d(&data, 2, 2, 2, &[2, 2, 2]).unwrap();
+        assert_eq!(dims, vec![1, 1, 1]);
+        assert!((out[0] - 5.0).abs() < 1e-9);
+    }
+
+    // --- imresize3_average ---
+
+    #[test]
+    fn test_imresize3_average_half() {
+        // 4×4×4 uniform volume, downsample by 2
+        let data = vec![2.0f64; 64];
+        let (out, dims) = imresize3_average(&data, 4, 4, 4, &[2, 2, 2]).unwrap();
+        assert_eq!(dims, vec![2, 2, 2]);
+        assert_eq!(out.len(), 8);
+        assert!(out.iter().all(|&v| (v - 2.0).abs() < 1e-9));
+    }
+
+    #[test]
+    fn test_imresize3_average_identity() {
+        let data: Vec<f64> = (0..27).map(|i| i as f64).collect();
+        let (out, dims) = imresize3_average(&data, 3, 3, 3, &[1, 1, 1]).unwrap();
+        assert_eq!(dims, vec![3, 3, 3]);
+        assert_eq!(out, data);
+    }
+
+    // --- check_resample_setting ---
+
+    #[test]
+    fn test_check_resample_setting_isotropic() {
+        let (factors, _z) =
+            check_resample_setting("isotropic", None, true, 32.45, 0.108, 0.3).unwrap();
+        assert_eq!(factors, [1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn test_check_resample_setting_given_scalar() {
+        let rs = [2.0f64];
+        let (factors, _) =
+            check_resample_setting("given", Some(&rs), false, 32.45, 0.108, 0.3).unwrap();
+        assert_eq!(factors, [2.0, 2.0, 2.0]);
+    }
+
+    #[test]
+    fn test_check_resample_setting_given_two() {
+        let rs = [1.5f64, 2.0];
+        let (factors, _) =
+            check_resample_setting("given", Some(&rs), false, 32.45, 0.108, 0.3).unwrap();
+        assert_eq!(factors, [1.5, 1.5, 2.0]);
+    }
+
+    #[test]
+    fn test_check_resample_setting_invalid_type() {
+        assert!(
+            check_resample_setting("unknown", None, false, 32.45, 0.108, 0.3).is_err()
+        );
+    }
+
+    // --- estimate_computing_memory ---
+
+    #[test]
+    fn test_estimate_computing_memory_basic() {
+        let im_size = [100usize, 200, 300];
+        let (cpu, gpu) = estimate_computing_memory(&im_size, &["deskew", "rotate"], 2, 1.5, 12.0);
+        assert!(cpu > 0.0);
+        assert!(gpu > 0.0);
+        assert!(gpu <= 12.0);
+    }
+
+    // --- integral_image_3d ---
+
+    #[test]
+    fn test_integral_image_3d_ones() {
+        // 2×2×2 volume of ones: corner sum should be 8
+        let data = vec![1.0f64; 8];
+        let out = integral_image_3d(&data, 2, 2, 2);
+        assert_eq!(out.len(), 8);
+        // Last voxel (1,1,1) should be sum of entire volume = 8
+        assert!((out[7] - 8.0).abs() < 1e-9, "corner sum = {}", out[7]);
+    }
+
+    #[test]
+    fn test_integral_image_3d_single_voxel() {
+        let data = vec![5.0f64];
+        let out = integral_image_3d(&data, 1, 1, 1);
+        assert_eq!(out, vec![5.0]);
     }
 }

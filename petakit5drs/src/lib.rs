@@ -27,8 +27,10 @@ pub mod utils;
 // between the two, or import each module directly.
 
 pub use image_processing::{
-    compute_bspline_coefficients, conv3_fast, filter_gauss_1d, filter_gauss_2d, filter_gauss_3d,
-    ImageProcessingError,
+    b3spline_1d, b3spline_2d, binary_sphere, bw_largest_obj, bwn_hood_3d,
+    compute_bspline_coefficients, conv3_fast, fast_gauss_3d, filter_gauss_1d, filter_gauss_2d,
+    filter_gauss_3d, gradient_filter_gauss_2d, gradient_filter_gauss_3d, invert_contrast,
+    local_avg_std_2d, scale_contrast, ImageProcessingError,
 };
 pub use io::{
     read_tiff,
@@ -39,13 +41,19 @@ pub use io::{
     // io::create_zarr is available as `petakit5drs::io::create_zarr`
 };
 pub use microscope_data_processing::{
+    check_resample_setting,
     crop_3d,
     crop_4d,
     deskew_frame_3d,
+    estimate_computing_memory,
     group_partial_volume_files,
+    imresize3_average,
+    integral_image_3d,
+    max_pooling_3d,
     project_3d_to_2d,
     resample_stack_3d,
     rotate_frame_3d,
+    scmos_camera_flip,
     MicroscopeProcessingError,
     // microscope_data_processing::create_zarr is available as
     // `petakit5drs::microscope_data_processing::create_zarr`
