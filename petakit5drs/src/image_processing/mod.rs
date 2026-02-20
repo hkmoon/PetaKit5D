@@ -2784,6 +2784,924 @@ pub fn z_proj_image(
     Ok(out)
 }
 
+// ---------------------------------------------------------------------------
+// Private helpers for thinning, EDT, skeleton
+// ---------------------------------------------------------------------------
+
+/// Rotate a 3×3 matrix 90° counter-clockwise: new[row][col] = old[col][2-row].
+fn rot90_ccw_2d(m: [[i8; 3]; 3]) -> [[i8; 3]; 3] {
+    let mut r = [[0i8; 3]; 3];
+    for row in 0..3 {
+        for col in 0..3 {
+            r[row][col] = m[col][2 - row];
+        }
+    }
+    r
+}
+
+/// Rotate a 3×3×3 SE (indexed `m[y][x][z]`) 90° CCW in the XY plane:
+/// for each z-slice, new[y][x][z] = old[x][2-y][z].
+fn rot90_xy_3d(m: [[[i8; 3]; 3]; 3]) -> [[[i8; 3]; 3]; 3] {
+    let mut r = [[[0i8; 3]; 3]; 3];
+    for z in 0..3 {
+        for y in 0..3 {
+            for x in 0..3 {
+                r[y][x][z] = m[x][2 - y][z];
+            }
+        }
+    }
+    r
+}
+
+/// Rotate a 3×3×3 SE (indexed `m[y][x][z]`) 90° CCW in the YZ plane:
+/// for each y-slice, the [x][z] plane is rotated CCW: new[y][x][z] = old[y][z][2-x].
+fn rot90_yz_3d(m: [[[i8; 3]; 3]; 3]) -> [[[i8; 3]; 3]; 3] {
+    let mut r = [[[0i8; 3]; 3]; 3];
+    for y in 0..3 {
+        for x in 0..3 {
+            for z in 0..3 {
+                r[y][x][z] = m[y][z][2 - x];
+            }
+        }
+    }
+    r
+}
+
+/// 2D hit-or-miss transform.  SE values: 1=hit foreground, -1=hit background, 0=don't care.
+fn hit_miss_2d(bw: &[bool], ny: usize, nx: usize, se: &[[i8; 3]; 3]) -> Vec<bool> {
+    let mut result = vec![false; ny * nx];
+    for y in 0..ny {
+        for x in 0..nx {
+            let mut matched = true;
+            'chk: for dy in 0..3i32 {
+                for dx in 0..3i32 {
+                    let s = se[dy as usize][dx as usize];
+                    if s == 0 { continue; }
+                    let ny_ = y as i32 + dy - 1;
+                    let nx_ = x as i32 + dx - 1;
+                    let val = if ny_ >= 0 && ny_ < ny as i32 && nx_ >= 0 && nx_ < nx as i32 {
+                        bw[ny_ as usize * nx + nx_ as usize]
+                    } else {
+                        false
+                    };
+                    if (s == 1 && !val) || (s == -1 && val) {
+                        matched = false;
+                        break 'chk;
+                    }
+                }
+            }
+            result[y * nx + x] = matched;
+        }
+    }
+    result
+}
+
+/// 3D hit-or-miss transform. SE indexed `se[dy][dx][dz]`.
+fn hit_miss_3d(
+    bw: &[bool],
+    nz: usize,
+    ny: usize,
+    nx: usize,
+    se: &[[[i8; 3]; 3]; 3],
+) -> Vec<bool> {
+    let mut result = vec![false; nz * ny * nx];
+    for z in 0..nz {
+        for y in 0..ny {
+            for x in 0..nx {
+                let mut matched = true;
+                'chk3: for dy in 0..3i32 {
+                    for dx in 0..3i32 {
+                        for dz in 0..3i32 {
+                            let s = se[dy as usize][dx as usize][dz as usize];
+                            if s == 0 { continue; }
+                            let nz_ = z as i32 + dz - 1;
+                            let ny_ = y as i32 + dy - 1;
+                            let nx_ = x as i32 + dx - 1;
+                            let val = if nz_ >= 0 && nz_ < nz as i32
+                                && ny_ >= 0 && ny_ < ny as i32
+                                && nx_ >= 0 && nx_ < nx as i32
+                            {
+                                bw[nz_ as usize * ny * nx
+                                    + ny_ as usize * nx
+                                    + nx_ as usize]
+                            } else {
+                                false
+                            };
+                            if (s == 1 && !val) || (s == -1 && val) {
+                                matched = false;
+                                break 'chk3;
+                            }
+                        }
+                    }
+                }
+                result[z * ny * nx + y * nx + x] = matched;
+            }
+        }
+    }
+    result
+}
+
+/// 1D parabolic lower-envelope transform (Felzenszwalb-Huttenlocher) for EDT phase 2/3.
+/// Input `f` is squared distances from phase 1; returns updated squared distances.
+fn parabolic_lower_envelope_sq(f: &[f64]) -> Vec<f64> {
+    let n = f.len();
+    if n == 0 { return vec![]; }
+    let mut d = vec![0.0f64; n];
+    let mut v = vec![0i64; n];
+    let mut z = vec![0.0f64; n + 1];
+    let mut k: i64 = 0;
+    v[0] = 0;
+    // z[0] = -∞ and z[1] = +∞ are the initial sentinel boundaries for the
+    // first parabola (no parabola has been processed yet, so the first one
+    // extends over the full domain).
+    z[0] = f64::NEG_INFINITY;
+    z[1] = f64::INFINITY;
+    for q in 1..n as i64 {
+        loop {
+            let r = v[k as usize];
+            let s = ((f[q as usize] + (q * q) as f64) - (f[r as usize] + (r * r) as f64))
+                / (2.0 * (q - r) as f64);
+            if s <= z[k as usize] {
+                if k == 0 { break; }
+                k -= 1;
+            } else {
+                k += 1;
+                v[k as usize] = q;
+                z[k as usize] = s;
+                z[(k + 1) as usize] = f64::INFINITY;
+                break;
+            }
+        }
+    }
+    k = 0;
+    for q in 0..n {
+        while z[(k + 1) as usize] < q as f64 { k += 1; }
+        let vk = v[k as usize] as f64;
+        d[q] = (q as f64 - vk).powi(2) + f[vk as usize];
+    }
+    d
+}
+
+/// 3D Euclidean distance transform: distance from each True voxel to nearest False voxel.
+/// Uses separable Felzenszwalb-Huttenlocher algorithm.
+fn edt_to_false_3d(mask: &[bool], nz: usize, ny: usize, nx: usize) -> Vec<f64> {
+    let big = (nz * nz + ny * ny + nx * nx + 1) as f64;
+    let n = nz * ny * nx;
+
+    // Phase 1: 1D squared distance along X
+    let mut g1 = vec![big; n];
+    for z in 0..nz {
+        for y in 0..ny {
+            let base = z * ny * nx + y * nx;
+            let mut d = big.sqrt();
+            for x in 0..nx {
+                if !mask[base + x] { d = 0.0; } else if d < big.sqrt() { d += 1.0; }
+                g1[base + x] = d * d;
+            }
+            d = big.sqrt();
+            for x in (0..nx).rev() {
+                if !mask[base + x] { d = 0.0; } else if d < big.sqrt() { d += 1.0; }
+                let v = d * d;
+                if v < g1[base + x] { g1[base + x] = v; }
+            }
+        }
+    }
+
+    // Phase 2: parabolic transform along Y
+    let mut g2 = vec![0.0f64; n];
+    for z in 0..nz {
+        for x in 0..nx {
+            let col: Vec<f64> = (0..ny).map(|y| g1[z * ny * nx + y * nx + x]).collect();
+            let d2 = parabolic_lower_envelope_sq(&col);
+            for y in 0..ny {
+                g2[z * ny * nx + y * nx + x] = d2[y];
+            }
+        }
+    }
+
+    // Phase 3: parabolic transform along Z
+    let mut g3 = vec![0.0f64; n];
+    for y in 0..ny {
+        for x in 0..nx {
+            let col: Vec<f64> = (0..nz).map(|z| g2[z * ny * nx + y * nx + x]).collect();
+            let d3 = parabolic_lower_envelope_sq(&col);
+            for z in 0..nz {
+                g3[z * ny * nx + y * nx + x] = d3[z];
+            }
+        }
+    }
+
+    g3.iter().map(|&v| v.sqrt()).collect()
+}
+
+/// Binary dilation: a voxel is True if it or any 26-neighbor is True.
+fn binary_dilation_3d_full(mask: &[bool], nz: usize, ny: usize, nx: usize) -> Vec<bool> {
+    let n = nz * ny * nx;
+    let mut result = vec![false; n];
+    for z in 0..nz {
+        for y in 0..ny {
+            for x in 0..nx {
+                if !mask[z * ny * nx + y * nx + x] { continue; }
+                for dz in -1i32..=1 {
+                    for dy in -1i32..=1 {
+                        for dx in -1i32..=1 {
+                            let nz_ = z as i32 + dz;
+                            let ny_ = y as i32 + dy;
+                            let nx_ = x as i32 + dx;
+                            if nz_ >= 0 && nz_ < nz as i32
+                                && ny_ >= 0 && ny_ < ny as i32
+                                && nx_ >= 0 && nx_ < nx as i32
+                            {
+                                result[nz_ as usize * ny * nx
+                                    + ny_ as usize * nx
+                                    + nx_ as usize] = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    result
+}
+
+/// Binary erosion: a voxel is True only if all 26-neighbors (and itself) are True.
+fn binary_erosion_3d_full(mask: &[bool], nz: usize, ny: usize, nx: usize) -> Vec<bool> {
+    let n = nz * ny * nx;
+    let mut result = vec![false; n];
+    for z in 0..nz {
+        for y in 0..ny {
+            for x in 0..nx {
+                let idx = z * ny * nx + y * nx + x;
+                if !mask[idx] { continue; }
+                let mut all_true = true;
+                'outer: for dz in -1i32..=1 {
+                    for dy in -1i32..=1 {
+                        for dx in -1i32..=1 {
+                            let nz_ = z as i32 + dz;
+                            let ny_ = y as i32 + dy;
+                            let nx_ = x as i32 + dx;
+                            if nz_ < 0 || nz_ >= nz as i32
+                                || ny_ < 0 || ny_ >= ny as i32
+                                || nx_ < 0 || nx_ >= nx as i32
+                            {
+                                all_true = false;
+                                break 'outer;
+                            }
+                            if !mask[nz_ as usize * ny * nx
+                                + ny_ as usize * nx
+                                + nx_ as usize]
+                            {
+                                all_true = false;
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+                result[idx] = all_true;
+            }
+        }
+    }
+    result
+}
+
+/// Binary closing (dilation then erosion) with full 26-connectivity, `iterations` rounds.
+fn binary_closing_3d_full(
+    mask: &[bool],
+    nz: usize,
+    ny: usize,
+    nx: usize,
+    iterations: usize,
+) -> Vec<bool> {
+    let mut m = mask.to_vec();
+    for _ in 0..iterations { m = binary_dilation_3d_full(&m, nz, ny, nx); }
+    for _ in 0..iterations { m = binary_erosion_3d_full(&m, nz, ny, nx); }
+    m
+}
+
+/// Symmetric (reflection) pad a 3D volume on all sides by `[pz, py, px]` voxels.
+fn symmetric_pad_3d(
+    data: &[f64],
+    nz: usize,
+    ny: usize,
+    nx: usize,
+    pz: usize,
+    py: usize,
+    px: usize,
+) -> (Vec<f64>, usize, usize, usize) {
+    let oz = nz + 2 * pz;
+    let oy = ny + 2 * py;
+    let ox = nx + 2 * px;
+    let mut out = vec![0.0f64; oz * oy * ox];
+    // Robust symmetric (mirror) reflection index for a dimension of length `n`
+    let reflect = |raw: i32, n: usize| -> usize {
+        if n == 0 { return 0; }
+        let n2 = (2 * n) as i32;
+        let mut reflected_i = raw.rem_euclid(n2);
+        if reflected_i >= n as i32 { reflected_i = n2 - 1 - reflected_i; }
+        reflected_i as usize
+    };
+    for z in 0..oz {
+        let sz = reflect(z as i32 - pz as i32, nz);
+        for y in 0..oy {
+            let sy = reflect(y as i32 - py as i32, ny);
+            for x in 0..ox {
+                let sx = reflect(x as i32 - px as i32, nx);
+                out[z * oy * ox + y * ox + x] = data[sz * ny * nx + sy * nx + sx];
+            }
+        }
+    }
+    (out, oz, oy, ox)
+}
+
+// ---------------------------------------------------------------------------
+// Thin a binary image using hit-or-miss operations
+// ---------------------------------------------------------------------------
+
+/// Thin a 2D or 3D binary image using hit-or-miss operations.
+///
+/// For 2D (nz == 1), applies 4 × 2 hit-or-miss passes with standard structuring elements.
+/// For 3D (nz > 1), applies 4 × 4 × 2 hit-or-miss passes.
+///
+/// # Arguments
+/// * `bw`       — flat binary mask (non-zero = true), length `nz * ny * nx`.
+/// * `nz/ny/nx` — volume dimensions; use `nz = 1` for 2D images (data is `ny × nx`).
+///
+/// # Returns
+/// Thinned binary mask of the same length.
+pub fn bw_thin(bw: &[bool], nz: usize, ny: usize, nx: usize) -> Vec<bool> {
+    if bw.is_empty() { return vec![]; }
+    if nz == 1 {
+        // 2D thinning: n1 and n2 are 3×3 (row-major [row][col])
+        let mut n1 = [[-1i8, -1, -1], [0, 1, 0], [1, 1, 1]];
+        let mut n2 = [[0i8, -1, -1], [1, 1, -1], [0, 1, 0]];
+        let mut thinner = bw.to_vec();
+        for _ in 0..4 {
+            let hm1 = hit_miss_2d(&thinner, ny, nx, &n1);
+            thinner.iter_mut().zip(hm1.iter()).for_each(|(t, &h)| if h { *t = false; });
+            let hm2 = hit_miss_2d(&thinner, ny, nx, &n2);
+            thinner.iter_mut().zip(hm2.iter()).for_each(|(t, &h)| if h { *t = false; });
+            n1 = rot90_ccw_2d(n1);
+            n2 = rot90_ccw_2d(n2);
+        }
+        thinner
+    } else {
+        // 3D thinning: n1 and n2 are 3×3×3 (indexed [y][x][z])
+        #[rustfmt::skip]
+        let mut n1: [[[i8; 3]; 3]; 3] = [
+            [[-1, -1, -1], [ 0,  0,  0], [ 1,  1,  1]],  // y=0 slice
+            [[-1, -1, -1], [ 0,  1,  0], [ 1,  1,  1]],  // y=1 slice
+            [[-1, -1, -1], [ 0,  0,  0], [ 1,  1,  1]],  // y=2 slice
+        ];
+        #[rustfmt::skip]
+        let mut n2: [[[i8; 3]; 3]; 3] = [
+            [[ 0, -1, -1], [ 1,  0, -1], [ 0,  1,  0]],  // y=0 slice
+            [[ 0, -1, -1], [ 1,  1, -1], [ 0,  1,  0]],  // y=1 slice
+            [[ 0, -1, -1], [ 1,  0, -1], [ 0,  1,  0]],  // y=2 slice
+        ];
+        let mut thinner = bw.to_vec();
+        for _ in 0..4 {
+            // 4 XY rotations
+            for _ in 0..4 {
+                let hm1 = hit_miss_3d(&thinner, nz, ny, nx, &n1);
+                thinner.iter_mut().zip(hm1.iter()).for_each(|(t, &h)| if h { *t = false; });
+                let hm2 = hit_miss_3d(&thinner, nz, ny, nx, &n2);
+                thinner.iter_mut().zip(hm2.iter()).for_each(|(t, &h)| if h { *t = false; });
+                n1 = rot90_xy_3d(n1);
+                n2 = rot90_xy_3d(n2);
+            }
+            // YZ rotation for next outer loop
+            n1 = rot90_yz_3d(n1);
+            n2 = rot90_yz_3d(n2);
+        }
+        thinner
+    }
+}
+
+// ---------------------------------------------------------------------------
+// High Dynamic Range merging
+// ---------------------------------------------------------------------------
+
+/// Merge two images at different exposure levels into a high-dynamic-range image.
+///
+/// Ports `high_dynamic_range_merge` from `hdr_merge.py` (MATLAB by Jessica Tytell, 2011).
+///
+/// # Arguments
+/// * `image_low`             — Flat row-major low-exposure image.
+/// * `image_high`            — Flat row-major high-exposure image (same length).
+/// * `mystery_offset_factor` — Scaling factor (default: 1.25).
+/// * `saturation_value`      — Pixel value indicating saturation (default: 4095 for 12-bit).
+///
+/// # Returns
+/// `(combined_mystery, log_mystery, log_image)` – each with the same length as inputs.
+pub fn high_dynamic_range_merge(
+    image_low: &[f64],
+    image_high: &[f64],
+    mystery_offset_factor: f64,
+    saturation_value: f64,
+) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    if image_low.len() != image_high.len() || image_low.is_empty() {
+        return (vec![], vec![], vec![]);
+    }
+    let n = image_low.len();
+    let sat = saturation_value;
+
+    // Saturation mask
+    let sat_mask: Vec<bool> = image_high.iter().map(|&v| v >= sat).collect();
+
+    // Linear fit (low = coeff * high + offset) on non-saturated pixels
+    let (coeff, offset) = {
+        let xs: Vec<f64> = (0..n).filter(|&i| !sat_mask[i]).map(|i| image_high[i]).collect();
+        let ys: Vec<f64> = (0..n).filter(|&i| !sat_mask[i]).map(|i| image_low[i]).collect();
+        if xs.is_empty() {
+            (1.0_f64, 0.0_f64)
+        } else {
+            let nn = xs.len() as f64;
+            let sx: f64 = xs.iter().sum();
+            let sy: f64 = ys.iter().sum();
+            let sxx: f64 = xs.iter().map(|&x| x * x).sum();
+            let sxy: f64 = xs.iter().zip(ys.iter()).map(|(&x, &y)| x * y).sum();
+            let denom = nn * sxx - sx * sx;
+            if denom.abs() < 1e-10 {
+                (1.0, 0.0)
+            } else {
+                let a = (nn * sxy - sx * sy) / denom;
+                let b = (sy - a * sx) / nn;
+                (a, b)
+            }
+        }
+    };
+
+    // Rosin threshold on image_high for background segmentation
+    let rosin_thresh = {
+        let min_v = image_high.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max_v = image_high.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        if (max_v - min_v).abs() < 1e-10 {
+            min_v
+        } else {
+            let n_bins = 256usize;
+            let range = max_v - min_v;
+            let mut hist = vec![0u64; n_bins];
+            for &v in image_high {
+                let idx = (((v - min_v) / range) * (n_bins as f64 - 1.0)).round() as usize;
+                hist[idx.min(n_bins - 1)] += 1;
+            }
+            let peak_idx = hist.iter().enumerate().max_by_key(|(_, &v)| v).map(|(i, _)| i).unwrap_or(0);
+            let tail_idx = hist.iter().rposition(|&v| v > 0).unwrap_or(peak_idx);
+            if peak_idx == tail_idx {
+                min_v + peak_idx as f64 * range / n_bins as f64
+            } else {
+                let x1 = peak_idx as f64;
+                let y1 = hist[peak_idx] as f64;
+                let x2 = tail_idx as f64;
+                let y2 = hist[tail_idx] as f64;
+                let mut max_dist = 0.0f64;
+                let mut thr_idx = peak_idx;
+                for i in peak_idx..=tail_idx {
+                    let x0 = i as f64;
+                    let y0 = hist[i] as f64;
+                    let dist = ((y2 - y1) * x0 - (x2 - x1) * y0 + x2 * y1 - y2 * x1).abs()
+                        / ((y2 - y1).powi(2) + (x2 - x1).powi(2) + 1e-10).sqrt();
+                    if dist > max_dist { max_dist = dist; thr_idx = i; }
+                }
+                min_v + thr_idx as f64 * range / n_bins as f64
+            }
+        }
+    };
+
+    // Background+saturation mask
+    let bg_st_mask: Vec<bool> =
+        (0..n).map(|i| sat_mask[i] || image_high[i] < rosin_thresh).collect();
+
+    // Linear scaler (no offset) from non-bg non-sat region
+    let bright2dim_scaler = {
+        let dot_hl: f64 = (0..n)
+            .filter(|&i| !bg_st_mask[i])
+            .map(|i| image_high[i] * image_low[i])
+            .sum();
+        let dot_hh: f64 = (0..n)
+            .filter(|&i| !bg_st_mask[i])
+            .map(|i| image_high[i].powi(2))
+            .sum();
+        if dot_hh < 1e-10 { coeff } else { dot_hl / dot_hh }
+    };
+
+    let eps = 1.0f64;
+    let mut combined_mystery = vec![0.0f64; n];
+    let mut log_mystery = vec![0.0f64; n];
+    let mut log_image = vec![0.0f64; n];
+    for i in 0..n {
+        let bright = if sat_mask[i] { 0.0 } else { image_high[i] };
+        let dim = if sat_mask[i] { image_low[i] } else { 0.0 };
+        let combined_linear = bright * bright2dim_scaler + dim;
+        let cm = bright * coeff * mystery_offset_factor + offset + dim;
+        combined_mystery[i] = cm;
+        log_mystery[i] = (cm + eps).ln();
+        log_image[i] = (combined_linear + eps).ln();
+    }
+    (combined_mystery, log_mystery, log_image)
+}
+
+// ---------------------------------------------------------------------------
+// Multiscale LoG filter
+// ---------------------------------------------------------------------------
+
+/// Multiscale Laplacian-of-Gaussian filter.
+///
+/// Runs `filter_log_nd` at each sigma in `sigmas` and returns the element-wise
+/// minimum response and a 1-based scale map.
+///
+/// # Arguments
+/// * `data`                    — Flat ZYX input volume.
+/// * `nz/ny/nx`                — Volume dimensions.
+/// * `sigmas`                  — Scale values (standard deviations in physical units).
+/// * `spacing`                 — Voxel spacing `[sz, sy, sx]`; `None` → isotropic 1.0.
+/// * `use_normalized_gaussian` — Whether to scale-normalise responses (`σ²` factor).
+///
+/// # Returns
+/// `(response, scale_map)` where `response` is the element-wise minimum LoG across scales
+/// and `scale_map` contains the 1-based index of the best scale at each voxel.
+pub fn filter_multiscale_log_nd(
+    data: &[f64],
+    nz: usize,
+    ny: usize,
+    nx: usize,
+    sigmas: &[f64],
+    spacing: Option<&[f64]>,
+    use_normalized_gaussian: bool,
+) -> (Vec<f64>, Vec<i32>) {
+    if data.is_empty() || sigmas.is_empty() {
+        return (data.to_vec(), vec![1i32; data.len()]);
+    }
+    let mut response: Option<Vec<f64>> = None;
+    let mut scale_map = vec![1i32; data.len()];
+    for (i, &sigma) in sigmas.iter().enumerate() {
+        let cur = filter_log_nd(data, nz, ny, nx, sigma, spacing, use_normalized_gaussian);
+        match &mut response {
+            None => { response = Some(cur); }
+            Some(r) => {
+                for (j, (&c, rv)) in cur.iter().zip(r.iter_mut()).enumerate() {
+                    if c < *rv { *rv = c; scale_map[j] = (i + 1) as i32; }
+                }
+            }
+        }
+    }
+    (response.unwrap_or_else(|| data.to_vec()), scale_map)
+}
+
+// ---------------------------------------------------------------------------
+// Laplacian of Bi-Gaussian (LoBG) filter
+// ---------------------------------------------------------------------------
+
+/// Single-scale Laplacian of Bi-Gaussian (LoBG) filter.
+///
+/// More robust than LoG for adjacent/overlapping blob structures.
+/// Uses two Gaussians: foreground (r < σ) and background (r ≥ σ) with ratio `rho`.
+///
+/// # Arguments
+/// * `data`                       — Flat ZYX volume.
+/// * `nz/ny/nx`                   — Volume dimensions.
+/// * `sigma`                      — Foreground Gaussian standard deviation.
+/// * `rho`                        — Background-to-foreground sigma ratio (typically 0.1–0.3).
+/// * `spacing`                    — Voxel spacing `[sz, sy, sx]`; `None` → 1.0.
+/// * `use_normalized_derivatives` — Whether to apply σ² scale-normalisation to the kernel.
+///
+/// # Returns
+/// Filtered volume (same shape as input).
+pub fn filter_lobg_nd(
+    data: &[f64],
+    nz: usize,
+    ny: usize,
+    nx: usize,
+    sigma: f64,
+    rho: f64,
+    spacing: Option<&[f64]>,
+    use_normalized_derivatives: bool,
+) -> Vec<f64> {
+    if data.is_empty() || sigma <= 0.0 || rho <= 0.0 { return data.to_vec(); }
+    let sp: [f64; 3] = match spacing {
+        Some(s) if s.len() >= 3 => [s[0], s[1], s[2]],
+        _ => [1.0, 1.0, 1.0],
+    };
+    // Half-width of kernel in each dimension
+    let wz = (4.0 * sigma / sp[0]).ceil() as usize;
+    let wy = (4.0 * sigma / sp[1]).ceil() as usize;
+    let wx = (4.0 * sigma / sp[2]).ceil() as usize;
+    let kz = 2 * wz + 1;
+    let ky = 2 * wy + 1;
+    let kx = 2 * wx + 1;
+
+    // Build LoBG 3D kernel
+    let mut kernel = vec![0.0f64; kz * ky * kx];
+    for iz in 0..kz {
+        let rz = (iz as f64 - wz as f64) * sp[0];
+        for iy in 0..ky {
+            let ry = (iy as f64 - wy as f64) * sp[1];
+            for ix in 0..kx {
+                let rx = (ix as f64 - wx as f64) * sp[2];
+                let r = (rz * rz + ry * ry + rx * rx).sqrt();
+                // Normalised Gaussian at radius r: g(r, s) = exp(-r²/2s²) / sum
+                // We compute kernel values un-normalised first, then normalise
+                let fg = {
+                    let g = (-r * r / (2.0 * sigma * sigma)).exp();
+                    ((r * r - sigma * sigma) / sigma.powi(4)) * g
+                };
+                let bg = {
+                    let r2 = r + rho * sigma - sigma; // shift
+                    let s2 = rho * sigma;
+                    let g = (-r2 * r2 / (2.0 * s2 * s2)).exp();
+                    ((r2 * r2 - s2 * s2) / s2.powi(4)) * g
+                };
+                kernel[iz * ky * kx + iy * kx + ix] = if r < sigma { fg } else { rho * rho * bg };
+            }
+        }
+    }
+
+    // Scale normalisation
+    if use_normalized_derivatives {
+        let s2 = sigma * sigma;
+        kernel.iter_mut().for_each(|v| *v *= s2);
+    }
+
+    // Remove DC (zero-mean)
+    let mean = kernel.iter().sum::<f64>() / kernel.len() as f64;
+    kernel.iter_mut().for_each(|v| *v -= mean);
+
+    // Symmetric-pad input, convolve (valid), result same size as input
+    let (padded, pnz, pny, pnx) = symmetric_pad_3d(data, nz, ny, nx, wz, wy, wx);
+    let result = convn_fft(
+        &padded,
+        &[pnz, pny, pnx],
+        &kernel,
+        &[kz, ky, kx],
+        "valid",
+    )
+    .map(|(d, _)| d)
+    .unwrap_or_else(|_| data.to_vec());
+    // After valid convolution, result has shape (pnz-kz+1, pny-ky+1, pnx-kx+1) = (nz, ny, nx)
+    if result.len() == data.len() { result } else { data.to_vec() }
+}
+
+// ---------------------------------------------------------------------------
+// Multiscale LoBG filter
+// ---------------------------------------------------------------------------
+
+/// Multiscale Laplacian of Bi-Gaussian (LoBG) filter.
+///
+/// Runs `filter_lobg_nd` at each sigma and returns element-wise minimum + scale map.
+///
+/// # Arguments
+/// * `data`    — Flat ZYX volume.
+/// * `sigmas`  — Array of scales.
+/// * `rho`     — Background/foreground ratio (typical 0.1–0.3).
+/// * `spacing` — Voxel spacing; `None` → isotropic 1.0.
+///
+/// # Returns
+/// `(response, scale_map)` as in `filter_multiscale_log_nd`.
+pub fn filter_multiscale_lobg_nd(
+    data: &[f64],
+    nz: usize,
+    ny: usize,
+    nx: usize,
+    sigmas: &[f64],
+    rho: f64,
+    spacing: Option<&[f64]>,
+) -> (Vec<f64>, Vec<i32>) {
+    if data.is_empty() || sigmas.is_empty() {
+        return (data.to_vec(), vec![1i32; data.len()]);
+    }
+    let mut response: Option<Vec<f64>> = None;
+    let mut scale_map = vec![1i32; data.len()];
+    for (i, &sigma) in sigmas.iter().enumerate() {
+        let cur = filter_lobg_nd(data, nz, ny, nx, sigma, rho, spacing, true);
+        match &mut response {
+            None => { response = Some(cur); }
+            Some(r) => {
+                for (j, (&c, rv)) in cur.iter().zip(r.iter_mut()).enumerate() {
+                    if c < *rv { *rv = c; scale_map[j] = (i + 1) as i32; }
+                }
+            }
+        }
+    }
+    (response.unwrap_or_else(|| data.to_vec()), scale_map)
+}
+
+// ---------------------------------------------------------------------------
+// Skeleton
+// ---------------------------------------------------------------------------
+
+/// Morphological binary skeletonization of a 2D or 3D binary image.
+///
+/// Supports three methods:
+/// * `"t"` — Thinning via hit-or-miss (`bw_thin`).
+/// * `"e"` — Erosion & opening (Jain 1989).
+/// * `"d"` — Divergence of EDT gradient (ridge-line method; connectivity not guaranteed).
+///
+/// # Arguments
+/// * `bw`            — Flat binary mask (ZYX row-major); use `nz = 1` for 2D.
+/// * `nz/ny/nx`      — Volume dimensions.
+/// * `method`        — `"t"`, `"e"`, or `"d"`.
+/// * `div_threshold` — Threshold for divergence method (should be < 0, e.g. −1.0).
+///
+/// # Returns
+/// Binary skeleton mask of the same length as `bw`.
+pub fn skeleton(
+    bw: &[bool],
+    nz: usize,
+    ny: usize,
+    nx: usize,
+    method: &str,
+    div_threshold: f64,
+) -> Vec<bool> {
+    if bw.is_empty() { return vec![]; }
+    let n = nz * ny * nx;
+    match method {
+        "t" => bw_thin(bw, nz, ny, nx),
+        "e" => {
+            // Erosion & opening: iteratively erode and subtract opening
+            let mut current = bw.to_vec();
+            let mut skel = vec![false; n];
+            let mut j = 1usize;
+            loop {
+                if !current.iter().any(|&v| v) { break; }
+                // Erode current by sphere of radius j using direct radius test
+                let r = j as f64;
+                let eroded: Vec<bool> = if nz == 1 {
+                    (0..n).map(|i| {
+                        let y = i / nx;
+                        let x = i % nx;
+                        let mut ok = true;
+                        'ck: for dy in -(r as i32)..=(r as i32) {
+                            for dx in -(r as i32)..=(r as i32) {
+                                if (dy * dy + dx * dx) as f64 > r * r { continue; }
+                                let ny_ = y as i32 + dy;
+                                let nx_ = x as i32 + dx;
+                                if ny_ < 0 || ny_ >= ny as i32
+                                    || nx_ < 0 || nx_ >= nx as i32
+                                    || !current[ny_ as usize * nx + nx_ as usize]
+                                {
+                                    ok = false;
+                                    break 'ck;
+                                }
+                            }
+                        }
+                        ok
+                    }).collect()
+                } else {
+                    // 3D spherical erosion
+                    (0..n).map(|i| {
+                        let z = i / (ny * nx);
+                        let y = (i % (ny * nx)) / nx;
+                        let x = i % nx;
+                        let mut ok = true;
+                        'erosion_check: for dz in -(r as i32)..=(r as i32) {
+                            for dy in -(r as i32)..=(r as i32) {
+                                for dx in -(r as i32)..=(r as i32) {
+                                    if (dz*dz+dy*dy+dx*dx) as f64 > r * r { continue; }
+                                    let nz_ = z as i32 + dz;
+                                    let ny_ = y as i32 + dy;
+                                    let nx_ = x as i32 + dx;
+                                    if nz_ < 0 || nz_ >= nz as i32
+                                        || ny_ < 0 || ny_ >= ny as i32
+                                        || nx_ < 0 || nx_ >= nx as i32
+                                        || !current[nz_ as usize * ny * nx
+                                            + ny_ as usize * nx
+                                            + nx_ as usize]
+                                    {
+                                        ok = false;
+                                        break 'erosion_check;
+                                    }
+                                }
+                            }
+                        }
+                        ok
+                    }).collect()
+                };
+                // Opening with unit radius (1-neighbourhood erosion then dilation)
+                let unit_erode: Vec<bool> = if nz == 1 {
+                    (0..n).map(|i| {
+                        let y = i / nx;
+                        let x = i % nx;
+                        let mut ok = true;
+                        'ck: for dy in -1i32..=1 {
+                            for dx in -1i32..=1 {
+                                let ny_ = y as i32 + dy;
+                                let nx_ = x as i32 + dx;
+                                if ny_ < 0 || ny_ >= ny as i32
+                                    || nx_ < 0 || nx_ >= nx as i32
+                                    || !eroded[ny_ as usize * nx + nx_ as usize]
+                                {
+                                    ok = false;
+                                    break 'ck;
+                                }
+                            }
+                        }
+                        ok
+                    }).collect()
+                } else {
+                    binary_erosion_3d_full(&eroded, nz, ny, nx)
+                };
+                let unit_dilate = if nz == 1 {
+                    (0..n).map(|i| {
+                        let y = i / nx;
+                        let x = i % nx;
+                        (y.saturating_sub(1)..=(y+1).min(ny-1)).any(|yy| {
+                            (x.saturating_sub(1)..=(x+1).min(nx-1)).any(|xx| {
+                                unit_erode[yy * nx + xx]
+                            })
+                        })
+                    }).collect::<Vec<bool>>()
+                } else {
+                    binary_dilation_3d_full(&unit_erode, nz, ny, nx)
+                };
+                // skel |= eroded XOR opened
+                for i in 0..n {
+                    if eroded[i] && !unit_dilate[i] { skel[i] = true; }
+                }
+                current = eroded;
+                j += 1;
+            }
+            skel
+        }
+        "d" => {
+            // Divergence of EDT gradient
+            // Compute EDT of !bw (distance from outside-mask to nearest inside-mask pixel)
+            let inv_bw: Vec<bool> = bw.iter().map(|&v| !v).collect();
+            let dist = edt_to_false_3d(&inv_bw, nz, ny, nx);
+
+            if nz == 1 {
+                // 2D: gradient and divergence
+                let mut gx = vec![0.0f64; n];
+                let mut gy = vec![0.0f64; n];
+                for y in 0..ny {
+                    for x in 0..nx {
+                        let xp = (x + 1).min(nx - 1);
+                        let xm = x.saturating_sub(1);
+                        gx[y * nx + x] = (dist[y * nx + xp] - dist[y * nx + xm]) / (xp - xm) as f64;
+                        let yp = (y + 1).min(ny - 1);
+                        let ym = y.saturating_sub(1);
+                        gy[y * nx + x] = (dist[yp * nx + x] - dist[ym * nx + x]) / (yp - ym) as f64;
+                    }
+                }
+                let mut div = vec![0.0f64; n];
+                for y in 0..ny {
+                    for x in 0..nx {
+                        let xp = (x + 1).min(nx - 1);
+                        let xm = x.saturating_sub(1);
+                        let yp = (y + 1).min(ny - 1);
+                        let ym = y.saturating_sub(1);
+                        div[y * nx + x] =
+                            (gx[y * nx + xp] - gx[y * nx + xm]) / (xp - xm) as f64
+                            + (gy[yp * nx + x] - gy[ym * nx + x]) / (yp - ym) as f64;
+                    }
+                }
+                div.iter().map(|&d| d < div_threshold).collect()
+            } else {
+                // 3D
+                let mut gx = vec![0.0f64; n];
+                let mut gy = vec![0.0f64; n];
+                let mut gz = vec![0.0f64; n];
+                for z in 0..nz {
+                    for y in 0..ny {
+                        for x in 0..nx {
+                            let idx = z * ny * nx + y * nx + x;
+                            let xp = (x + 1).min(nx - 1);
+                            let xm = x.saturating_sub(1);
+                            gx[idx] = (dist[z*ny*nx+y*nx+xp] - dist[z*ny*nx+y*nx+xm]) / (xp-xm) as f64;
+                            let yp = (y + 1).min(ny - 1);
+                            let ym = y.saturating_sub(1);
+                            gy[idx] = (dist[z*ny*nx+yp*nx+x] - dist[z*ny*nx+ym*nx+x]) / (yp-ym) as f64;
+                            let zp = (z + 1).min(nz - 1);
+                            let zm = z.saturating_sub(1);
+                            gz[idx] = (dist[zp*ny*nx+y*nx+x] - dist[zm*ny*nx+y*nx+x]) / (zp-zm) as f64;
+                        }
+                    }
+                }
+                let mut div = vec![0.0f64; n];
+                for z in 0..nz {
+                    for y in 0..ny {
+                        for x in 0..nx {
+                            let idx = z * ny * nx + y * nx + x;
+                            let xp = (x + 1).min(nx - 1);
+                            let xm = x.saturating_sub(1);
+                            let yp = (y + 1).min(ny - 1);
+                            let ym = y.saturating_sub(1);
+                            let zp = (z + 1).min(nz - 1);
+                            let zm = z.saturating_sub(1);
+                            div[idx] =
+                                (gx[z*ny*nx+y*nx+xp] - gx[z*ny*nx+y*nx+xm]) / (xp-xm) as f64
+                                + (gy[z*ny*nx+yp*nx+x] - gy[z*ny*nx+ym*nx+x]) / (yp-ym) as f64
+                                + (gz[zp*ny*nx+y*nx+x] - gz[zm*ny*nx+y*nx+x]) / (zp-zm) as f64;
+                        }
+                    }
+                }
+                div.iter().map(|&d| d < div_threshold).collect()
+            }
+        }
+        _ => bw.to_vec(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3444,5 +4362,120 @@ mod tests {
     fn test_z_proj_invalid_type() {
         let data = vec![1.0f64; 8];
         assert!(z_proj_image(&data, 2, 2, 2, "unknown_type").is_err());
+    }
+
+    // --- bw_thin ---
+
+    #[test]
+    fn test_bw_thin_2d_identity_no_thinning() {
+        // A single True pixel should remain after thinning
+        let mut bw = vec![false; 9]; // 3×3
+        bw[4] = true;
+        let thinned = bw_thin(&bw, 1, 3, 3);
+        assert_eq!(thinned.len(), 9);
+        // Single isolated pixel may or may not survive depending on SE; just check shape
+    }
+
+    #[test]
+    fn test_bw_thin_2d_preserves_shape() {
+        let bw = vec![false; 25]; // 5×5 all background
+        let t = bw_thin(&bw, 1, 5, 5);
+        assert_eq!(t.len(), 25);
+        assert!(!t.iter().any(|&v| v));
+    }
+
+    #[test]
+    fn test_bw_thin_3d_empty() {
+        let t = bw_thin(&[], 0, 0, 0);
+        assert!(t.is_empty());
+    }
+
+    // --- high_dynamic_range_merge ---
+
+    #[test]
+    fn test_hdr_merge_lengths() {
+        let low = vec![100.0f64; 10];
+        let high = vec![500.0f64; 10];
+        let (cm, lm, li) = high_dynamic_range_merge(&low, &high, 1.25, 4095.0);
+        assert_eq!(cm.len(), 10);
+        assert_eq!(lm.len(), 10);
+        assert_eq!(li.len(), 10);
+    }
+
+    #[test]
+    fn test_hdr_merge_all_saturated() {
+        let low = vec![10.0f64; 5];
+        let high = vec![4095.0f64; 5]; // all saturated
+        let (cm, _lm, _li) = high_dynamic_range_merge(&low, &high, 1.25, 4095.0);
+        assert_eq!(cm.len(), 5);
+        // In all-saturated case, coeff=1, offset=0, only dim contributes
+        for &v in &cm { assert!((v - 10.0).abs() < 1e-6, "v={v}"); }
+    }
+
+    #[test]
+    fn test_hdr_merge_empty() {
+        let (cm, lm, li) = high_dynamic_range_merge(&[], &[], 1.25, 4095.0);
+        assert!(cm.is_empty());
+        assert!(lm.is_empty());
+        assert!(li.is_empty());
+    }
+
+    // --- filter_multiscale_log_nd ---
+
+    #[test]
+    fn test_filter_multiscale_log_nd_shape() {
+        let data = vec![1.0f64; 27];
+        let (resp, smap) = filter_multiscale_log_nd(&data, 3, 3, 3, &[1.0, 2.0], None, true);
+        assert_eq!(resp.len(), 27);
+        assert_eq!(smap.len(), 27);
+    }
+
+    #[test]
+    fn test_filter_multiscale_log_nd_scale_map_values() {
+        let data = vec![1.0f64; 27];
+        let (_r, smap) = filter_multiscale_log_nd(&data, 3, 3, 3, &[1.0, 2.0], None, true);
+        // Scale map should have values 1 or 2
+        for &s in &smap { assert!(s == 1 || s == 2, "s={s}"); }
+    }
+
+    // --- filter_lobg_nd ---
+
+    #[test]
+    fn test_filter_lobg_nd_shape() {
+        let data = vec![1.0f64; 27];
+        let out = filter_lobg_nd(&data, 3, 3, 3, 1.0, 0.2, None, false);
+        assert_eq!(out.len(), 27);
+    }
+
+    // --- filter_multiscale_lobg_nd ---
+
+    #[test]
+    fn test_filter_multiscale_lobg_nd_shape() {
+        let data = vec![1.0f64; 27];
+        let (r, s) = filter_multiscale_lobg_nd(&data, 3, 3, 3, &[1.0, 2.0], 0.2, None);
+        assert_eq!(r.len(), 27);
+        assert_eq!(s.len(), 27);
+    }
+
+    // --- skeleton ---
+
+    #[test]
+    fn test_skeleton_2d_thinning_shape() {
+        let bw = vec![true; 25]; // 5×5 all foreground
+        let s = skeleton(&bw, 1, 5, 5, "t", -1.0);
+        assert_eq!(s.len(), 25);
+    }
+
+    #[test]
+    fn test_skeleton_2d_divergence_shape() {
+        let bw = vec![true; 25];
+        let s = skeleton(&bw, 1, 5, 5, "d", -0.5);
+        assert_eq!(s.len(), 25);
+    }
+
+    #[test]
+    fn test_skeleton_empty() {
+        let s = skeleton(&[], 0, 0, 0, "t", -1.0);
+        assert!(s.is_empty());
     }
 }

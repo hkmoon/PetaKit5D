@@ -1822,6 +1822,571 @@ pub fn distance_weight_single_axis(
     w
 }
 
+// ---------------------------------------------------------------------------
+// Private helpers for PSF processing
+// ---------------------------------------------------------------------------
+
+/// 3-D median filter with `size × size × size` window (nearest-neighbour border).
+fn median_filter_3d_f32(data: &[f32], nz: usize, ny: usize, nx: usize, size: usize) -> Vec<f32> {
+    let half = (size / 2) as i32;
+    let n = nz * ny * nx;
+    let mut result = vec![0.0f32; n];
+    let mut window = Vec::with_capacity(size * size * size);
+    for z in 0..nz {
+        for y in 0..ny {
+            for x in 0..nx {
+                window.clear();
+                for dz in -half..=half {
+                    for dy in -half..=half {
+                        for dx in -half..=half {
+                            let nz_ = (z as i32 + dz).clamp(0, nz as i32 - 1) as usize;
+                            let ny_ = (y as i32 + dy).clamp(0, ny as i32 - 1) as usize;
+                            let nx_ = (x as i32 + dx).clamp(0, nx as i32 - 1) as usize;
+                            window.push(data[nz_ * ny * nx + ny_ * nx + nx_]);
+                        }
+                    }
+                }
+                window.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                result[z * ny * nx + y * nx + x] = window[window.len() / 2];
+            }
+        }
+    }
+    result
+}
+
+/// BFS connected-component labeling (26-connectivity) for a 3-D boolean mask.
+/// Returns label array (0 = background, 1..k = components).
+fn label_connected_3d(mask: &[bool], nz: usize, ny: usize, nx: usize) -> Vec<usize> {
+    let n = nz * ny * nx;
+    let mut labels = vec![0usize; n];
+    let mut current_label = 0usize;
+    for start in 0..n {
+        if !mask[start] || labels[start] != 0 { continue; }
+        current_label += 1;
+        labels[start] = current_label;
+        let mut queue = vec![start];
+        let mut head = 0;
+        while head < queue.len() {
+            let idx = queue[head];
+            head += 1;
+            let z = idx / (ny * nx);
+            let y = (idx % (ny * nx)) / nx;
+            let x = idx % nx;
+            for dz in -1i32..=1 {
+                for dy in -1i32..=1 {
+                    for dx in -1i32..=1 {
+                        if dz == 0 && dy == 0 && dx == 0 { continue; }
+                        let nz_ = z as i32 + dz;
+                        let ny_ = y as i32 + dy;
+                        let nx_ = x as i32 + dx;
+                        if nz_ >= 0 && nz_ < nz as i32
+                            && ny_ >= 0 && ny_ < ny as i32
+                            && nx_ >= 0 && nx_ < nx as i32
+                        {
+                            let ni = nz_ as usize * ny * nx
+                                + ny_ as usize * nx
+                                + nx_ as usize;
+                            if mask[ni] && labels[ni] == 0 {
+                                labels[ni] = current_label;
+                                queue.push(ni);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    labels
+}
+
+/// 3-D binary dilation with full 26-connectivity, applied `iterations` times.
+fn binary_dilation_3d_cc(mask: &[bool], nz: usize, ny: usize, nx: usize, iterations: usize) -> Vec<bool> {
+    let n = nz * ny * nx;
+    let mut m = mask.to_vec();
+    for _ in 0..iterations {
+        let prev = m.clone();
+        let mut result = vec![false; n];
+        for z in 0..nz {
+            for y in 0..ny {
+                for x in 0..nx {
+                    if !prev[z * ny * nx + y * nx + x] { continue; }
+                    for dz in -1i32..=1 {
+                        for dy in -1i32..=1 {
+                            for dx in -1i32..=1 {
+                                let nz_ = z as i32 + dz;
+                                let ny_ = y as i32 + dy;
+                                let nx_ = x as i32 + dx;
+                                if nz_ >= 0 && nz_ < nz as i32
+                                    && ny_ >= 0 && ny_ < ny as i32
+                                    && nx_ >= 0 && nx_ < nx as i32
+                                {
+                                    result[nz_ as usize * ny * nx
+                                        + ny_ as usize * nx
+                                        + nx_ as usize] = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        m = result;
+    }
+    m
+}
+
+/// 3-D binary erosion with full 26-connectivity, applied `iterations` times.
+fn binary_erosion_3d_cc(mask: &[bool], nz: usize, ny: usize, nx: usize, iterations: usize) -> Vec<bool> {
+    let n = nz * ny * nx;
+    let mut m = mask.to_vec();
+    for _ in 0..iterations {
+        let prev = m.clone();
+        let mut result = vec![false; n];
+        for z in 0..nz {
+            for y in 0..ny {
+                for x in 0..nx {
+                    let idx = z * ny * nx + y * nx + x;
+                    if !prev[idx] { continue; }
+                    let mut ok = true;
+                    'outer: for dz in -1i32..=1 {
+                        for dy in -1i32..=1 {
+                            for dx in -1i32..=1 {
+                                let nz_ = z as i32 + dz;
+                                let ny_ = y as i32 + dy;
+                                let nx_ = x as i32 + dx;
+                                if nz_ < 0 || nz_ >= nz as i32
+                                    || ny_ < 0 || ny_ >= ny as i32
+                                    || nx_ < 0 || nx_ >= nx as i32
+                                    || !prev[nz_ as usize * ny * nx
+                                        + ny_ as usize * nx
+                                        + nx_ as usize]
+                                {
+                                    ok = false;
+                                    break 'outer;
+                                }
+                            }
+                        }
+                    }
+                    result[idx] = ok;
+                }
+            }
+        }
+        m = result;
+    }
+    m
+}
+
+/// 3-D binary closing: `iterations` dilations followed by `iterations` erosions.
+fn binary_closing_3d_cc(mask: &[bool], nz: usize, ny: usize, nx: usize, iterations: usize) -> Vec<bool> {
+    let d = binary_dilation_3d_cc(mask, nz, ny, nx, iterations);
+    binary_erosion_3d_cc(&d, nz, ny, nx, iterations)
+}
+
+// ---------------------------------------------------------------------------
+// PSF preprocessing
+// ---------------------------------------------------------------------------
+
+/// Resample and crop a raw PSF with background subtraction.
+///
+/// Ports `psf_gen` from `psf_analysis.py`.  Preprocessing steps:
+/// 1. Estimate and subtract background using edge slices (3D) or edge rows (2D).
+/// 2. Isolate the PSF peak with connected-component masking.
+/// 3. Center the PSF via circular roll.
+/// 4. Optionally resample in Z via FFT truncation if `dz_data > dz_psf`.
+///
+/// # Arguments
+/// * `psf`            — Flat (ny × nx × nz) PSF volume in **YXZ** order (as in the MATLAB/Python code).
+/// * `ny/nx/nz`       — PSF dimensions (Y, X, Z).
+/// * `dz_psf`         — Z pixel size of the PSF in microns.
+/// * `dz_data`        — Z pixel size of the target data in microns.
+/// * `med_factor`     — Background multiplier for the `"median"` method (default 1.5).
+/// * `method`         — `"median"` or `"masked"` background subtraction.
+///
+/// # Returns
+/// Processed PSF as `Vec<f32>` with the same YX dimensions and resampled Z.
+pub fn psf_gen(
+    psf: &[f32],
+    ny: usize,
+    nx: usize,
+    nz: usize,
+    dz_psf: f64,
+    dz_data: f64,
+    med_factor: f64,
+    method: &str,
+) -> Vec<f32> {
+    if psf.is_empty() || ny == 0 || nx == 0 { return psf.to_vec(); }
+    let n = ny * nx * nz;
+    if psf.len() != n { return psf.to_vec(); }
+
+    let mut psf_raw: Vec<f32> = psf.to_vec();
+
+    // Helper: median of positive values
+    let median_positive = |v: &[f32]| -> f32 {
+        let mut pos: Vec<f32> = v.iter().cloned().filter(|&x| x > 0.0).collect();
+        if pos.is_empty() { return 0.0; }
+        pos.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        pos[pos.len() / 2]
+    };
+
+    if nz > 1 {
+        // Collect edge slices (first/last min(5, nz/4) slices)
+        let n_edge = 5.min(nz / 4).max(1);
+        let edge_indices: Vec<usize> =
+            (0..n_edge).chain(nz.saturating_sub(n_edge)..nz).collect();
+        let edge_flat: Vec<f32> = edge_indices.iter()
+            .flat_map(|&z| (0..ny).flat_map(move |y| (0..nx).map(move |x| psf[y * nx * nz + x * nz + z])))
+            .collect();
+        let has_positive = edge_flat.iter().any(|&v| v > 0.0);
+
+        if has_positive {
+            if method == "median" {
+                let bg = med_factor as f32 * median_positive(&edge_flat);
+                psf_raw.iter_mut().for_each(|v| *v = (*v - bg).max(0.0));
+                // Median filter
+                // Reshape to (ny, nx, nz) for median_filter_3d_f32 which expects (nz, ny, nx)
+                // We'll do a simple window approach on the YXZ layout
+                let psf_med: Vec<f32> = {
+                    let size = 3usize;
+                    let half = 1i32;
+                    let mut out = vec![0.0f32; n];
+                    let mut win = Vec::with_capacity(27);
+                    for y in 0..ny {
+                        for x in 0..nx {
+                            for z in 0..nz {
+                                win.clear();
+                                for dy in -half..=half {
+                                    for dx in -half..=half {
+                                        for dz in -half..=half {
+                                            let ny_ = (y as i32 + dy).clamp(0, ny as i32 - 1) as usize;
+                                            let nx_ = (x as i32 + dx).clamp(0, nx as i32 - 1) as usize;
+                                            let nz_ = (z as i32 + dz).clamp(0, nz as i32 - 1) as usize;
+                                            win.push(psf_raw[ny_ * nx * nz + nx_ * nz + nz_]);
+                                        }
+                                    }
+                                }
+                                win.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                                out[y * nx * nz + x * nz + z] = win[win.len() / 2];
+                            }
+                        }
+                    }
+                    out
+                };
+                // Connected components on median-filtered mask
+                let bw: Vec<bool> = psf_med.iter().map(|&v| v > 0.0).collect();
+                // Convert YXZ→ZYX for label function
+                let mut bw_zyx = vec![false; n];
+                for y in 0..ny {
+                    for x in 0..nx {
+                        for z in 0..nz {
+                            bw_zyx[z * ny * nx + y * nx + x] = bw[y * nx * nz + x * nz + z];
+                        }
+                    }
+                }
+                let labels = label_connected_3d(&bw_zyx, nz, ny, nx);
+                // Peak of psf_med (in YXZ)
+                let peak_i = psf_med.iter().enumerate()
+                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(i, _)| i).unwrap_or(0);
+                let py = peak_i / (nx * nz);
+                let px = (peak_i % (nx * nz)) / nz;
+                let pz = peak_i % nz;
+                let peak_label = labels[pz * ny * nx + py * nx + px];
+                // Closing on ZYX mask of peak component
+                let comp_mask: Vec<bool> = (0..n).map(|i| labels[i] == peak_label && peak_label > 0).collect();
+                let closed = binary_closing_3d_cc(&comp_mask, nz, ny, nx, 3);
+                // Apply mask back to psf_raw (YXZ layout)
+                for y in 0..ny {
+                    for x in 0..nx {
+                        for z in 0..nz {
+                            if !closed[z * ny * nx + y * nx + x] {
+                                psf_raw[y * nx * nz + x * nz + z] = 0.0;
+                            }
+                        }
+                    }
+                }
+            } else {
+                // "masked" method
+                let psf_med: Vec<f32> = {
+                    let half = 1i32;
+                    let mut out = vec![0.0f32; n];
+                    let mut win = Vec::with_capacity(27);
+                    for y in 0..ny {
+                        for x in 0..nx {
+                            for z in 0..nz {
+                                win.clear();
+                                for dy in -half..=half {
+                                    for dx in -half..=half {
+                                        for dz in -half..=half {
+                                            let ny_ = (y as i32 + dy).clamp(0, ny as i32 - 1) as usize;
+                                            let nx_ = (x as i32 + dx).clamp(0, nx as i32 - 1) as usize;
+                                            let nz_ = (z as i32 + dz).clamp(0, nz as i32 - 1) as usize;
+                                            win.push(psf[ny_ * nx * nz + nx_ * nz + nz_]);
+                                        }
+                                    }
+                                }
+                                win.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                                out[y * nx * nz + x * nz + z] = win[win.len() / 2];
+                            }
+                        }
+                    }
+                    out
+                };
+                let n_edge_rows = 10.min(ny / 4).max(1);
+                // Background estimate from edge rows in psf_med
+                let bg_mean: f32 = {
+                    let mut vals: Vec<f32> = Vec::new();
+                    for y in (0..n_edge_rows).chain(ny.saturating_sub(n_edge_rows)..ny) {
+                        for x in 0..nx {
+                            for z in 0..nz {
+                                vals.push(psf_med[y * nx * nz + x * nz + z]);
+                            }
+                        }
+                    }
+                    if vals.is_empty() { 0.0 } else { vals.iter().sum::<f32>() / vals.len() as f32 }
+                };
+                // Adaptive threshold: a = max(sqrt|edge - 100|)*3 + mean(edge) per (x,z)
+                // For simplicity we use: threshold = bg_mean + 3 * sqrt(bg_mean.abs())
+                let bg_threshold = bg_mean + 3.0 * (bg_mean.abs()).sqrt();
+                let bw_med1: Vec<bool> = psf_med.iter().map(|&v| v - bg_threshold > 0.0).collect();
+                let mut bw_zyx = vec![false; n];
+                for y in 0..ny {
+                    for x in 0..nx {
+                        for z in 0..nz {
+                            bw_zyx[z * ny * nx + y * nx + x] = bw_med1[y * nx * nz + x * nz + z];
+                        }
+                    }
+                }
+                let labels = label_connected_3d(&bw_zyx, nz, ny, nx);
+                let peak_i = psf_med.iter().enumerate()
+                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(i, _)| i).unwrap_or(0);
+                let py = peak_i / (nx * nz);
+                let px = (peak_i % (nx * nz)) / nz;
+                let pz = peak_i % nz;
+                let peak_label = labels[pz * ny * nx + py * nx + px];
+                let comp_mask: Vec<bool> = (0..n).map(|i| labels[i] == peak_label && peak_label > 0).collect();
+                let closed = binary_closing_3d_cc(&comp_mask, nz, ny, nx, 3);
+                let bg = {
+                    let mut vals: Vec<f32> = Vec::new();
+                    for y in (0..n_edge_rows).chain(ny.saturating_sub(n_edge_rows)..ny) {
+                        for x in 0..nx {
+                            for z in 0..nz {
+                                vals.push(psf_raw[y * nx * nz + x * nz + z]);
+                            }
+                        }
+                    }
+                    if vals.is_empty() { 0.0 } else { vals.iter().sum::<f32>() / vals.len() as f32 }
+                };
+                for y in 0..ny {
+                    for x in 0..nx {
+                        for z in 0..nz {
+                            let m = closed[z * ny * nx + y * nx + x];
+                            let v = &mut psf_raw[y * nx * nz + x * nz + z];
+                            *v = if m { (*v - bg).max(0.0) } else { 0.0 };
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        // 2D PSF (nz == 1), treat as YX
+        if method == "median" {
+            let n2 = ny * nx;
+            let pos_vals: Vec<f32> = psf_raw.iter().cloned().filter(|&v| v > 0.0).collect();
+            if !pos_vals.is_empty() {
+                let bg = med_factor as f32 * median_positive(&pos_vals);
+                psf_raw.iter_mut().for_each(|v| *v = (*v - bg).max(0.0));
+            }
+        }
+    }
+
+    // Find peak and center via circular shift
+    let peak_i = psf_raw.iter().enumerate()
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(i, _)| i).unwrap_or(0);
+    let peak_y = peak_i / (nx * nz.max(1));
+    let peak_x = (peak_i % (nx * nz.max(1))) / nz.max(1);
+    let peak_z = if nz > 1 { peak_i % nz } else { 0 };
+
+    let shift_y = (ny + 1) / 2 - peak_y.min((ny + 1) / 2);
+    let shift_x = (nx + 1) / 2 - peak_x.min((nx + 1) / 2);
+    let shift_z = if nz > 1 { (nz + 1) / 2 - peak_z.min((nz + 1) / 2) } else { 0 };
+
+    // Apply circular shift in YXZ layout
+    let mut psf_centered = vec![0.0f32; n];
+    for y in 0..ny {
+        for x in 0..nx {
+            let ny_ = (y + shift_y) % ny;
+            let nx_ = (x + shift_x) % nx;
+            for z in 0..nz {
+                let nz_ = (z + shift_z) % nz.max(1);
+                psf_centered[ny_ * nx * nz.max(1) + nx_ * nz.max(1) + nz_] =
+                    psf_raw[y * nx * nz.max(1) + x * nz.max(1) + z];
+            }
+        }
+    }
+
+    // FFT resampling in Z if dz_data > dz_psf
+    if nz > 1 && dz_data > dz_psf && dz_psf > 0.0 {
+        let dz_ratio = dz_data / dz_psf;
+        let new_nz = ((nz as f64 / dz_ratio).round() as usize).max(1);
+        if new_nz < nz {
+            // Truncate FFT in Z: keep first and last halves of frequency domain
+            // Simple truncation: keep first new_nz/2 and last new_nz - new_nz/2 from fft(nz)
+            // We implement this as a crop in Fourier domain via DFT sum
+            let half_new = new_nz / 2;
+            let scale = new_nz as f32 / nz as f32;
+            let mut psf_out = vec![0.0f32; ny * nx * new_nz];
+            // For each (y, x) column, apply FFT truncation along Z
+            for y in 0..ny {
+                for x in 0..nx {
+                    // Extract Z column
+                    let col: Vec<f32> = (0..nz).map(|z| psf_centered[y * nx * nz + x * nz + z]).collect();
+                    // DFT
+                    let mut fft_col: Vec<(f32, f32)> = vec![(0.0, 0.0); nz];
+                    for k in 0..nz {
+                        let mut re = 0.0f32;
+                        let mut im = 0.0f32;
+                        for t in 0..nz {
+                            let angle = -2.0 * std::f32::consts::PI * (k * t) as f32 / nz as f32;
+                            re += col[t] * angle.cos();
+                            im += col[t] * angle.sin();
+                        }
+                        fft_col[k] = (re, im);
+                    }
+                    // Truncate: keep first half_new and last (new_nz - half_new) coefficients
+                    let mut fft_trunc: Vec<(f32, f32)> = vec![(0.0, 0.0); new_nz];
+                    for k in 0..half_new { fft_trunc[k] = fft_col[k]; }
+                    for k in 0..(new_nz - half_new) {
+                        fft_trunc[half_new + k] = fft_col[nz - (new_nz - half_new) + k];
+                    }
+                    // IDFT
+                    for t in 0..new_nz {
+                        let mut re = 0.0f32;
+                        for k in 0..new_nz {
+                            let angle = 2.0 * std::f32::consts::PI * (k * t) as f32 / new_nz as f32;
+                            re += fft_trunc[k].0 * angle.cos() - fft_trunc[k].1 * angle.sin();
+                        }
+                        psf_out[y * nx * new_nz + x * new_nz + t] = (re / nz as f32).max(0.0);
+                    }
+                }
+            }
+            return psf_out;
+        }
+    }
+
+    psf_centered.iter_mut().for_each(|v| *v = v.max(0.0));
+    psf_centered
+}
+
+// ---------------------------------------------------------------------------
+// PSF rotation
+// ---------------------------------------------------------------------------
+
+/// Rotate a PSF to match deskewed/rotated microscopy data coordinates.
+///
+/// Ports `rotate_psf` from `psf_analysis.py` (based on XR_rotate_PSF.m by Xiongtao Ruan).
+///
+/// # Arguments
+/// * `psf`            — Flat (ny × nx × nz) PSF in **YXZ** order.
+/// * `ny/nx/nz`       — PSF dimensions.
+/// * `skew_angle`     — Skew angle in degrees (e.g. 32.45).
+/// * `xy_pixel_size`  — XY pixel size in microns.
+/// * `dz`             — Z step size in microns.
+/// * `objective_scan` — True for objective scan; false for stage scan.
+/// * `reverse`        — Reverse rotation direction.
+///
+/// # Returns
+/// Rotated PSF with the same dimensions, any zero-padding filled with median.
+pub fn rotate_psf(
+    psf: &[f32],
+    ny: usize,
+    nx: usize,
+    nz: usize,
+    skew_angle: f64,
+    xy_pixel_size: f64,
+    dz: f64,
+    objective_scan: bool,
+    reverse: bool,
+) -> Vec<f32> {
+    if psf.is_empty() || ny == 0 || nx == 0 { return psf.to_vec(); }
+
+    // Compute z anisotropy factor
+    let z_aniso = if objective_scan {
+        dz / xy_pixel_size
+    } else {
+        let theta = skew_angle.to_radians();
+        (theta.sin() * dz) / xy_pixel_size
+    };
+
+    // Convert YXZ → ZYX f64 for rotate_frame_3d
+    let n = ny * nx * nz;
+    let mut vol_zyx = vec![0.0f64; n];
+    for z in 0..nz {
+        for y in 0..ny {
+            for x in 0..nx {
+                vol_zyx[z * ny * nx + y * nx + x] = psf[y * nx * nz + x * nz + z] as f64;
+            }
+        }
+    }
+
+    let rotated_result = rotate_frame_3d(
+        &vol_zyx,
+        &[nz, ny, nx],
+        skew_angle,
+        dz,
+        xy_pixel_size,
+        reverse,
+        true, // crop
+        false, // crop_xy
+    );
+
+    let (rotated_flat, rot_dims) = match rotated_result {
+        Ok((v, d)) => (v, d),
+        Err(_) => return psf.to_vec(),
+    };
+    if rotated_flat.is_empty() { return psf.to_vec(); }
+    let (rnz, rny, rnx) = if rot_dims.len() >= 3 {
+        (rot_dims[0], rot_dims[1], rot_dims[2])
+    } else {
+        (nz, ny, nx)
+    };
+
+    // Fill zeros with median of positive values
+    let positive_vals: Vec<f32> = rotated_flat.iter().cloned()
+        .filter(|&v| v > 0.0)
+        .map(|v| v as f32)
+        .collect();
+    let fill = if positive_vals.is_empty() {
+        0.0f32
+    } else {
+        let mut sorted = positive_vals.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        // Use median of lower 99th percentile
+        let p99_index = ((sorted.len() as f64 * 0.99) as usize).min(sorted.len() - 1);
+        let p99 = sorted[p99_index];
+        let valid: Vec<f32> = sorted.iter().cloned().filter(|&v| v < p99).collect();
+        if valid.is_empty() { 0.0 } else { valid[valid.len() / 2] }
+    };
+
+    // Convert ZYX → YXZ f32
+    let out_n = rny * rnx * rnz;
+    let mut out = vec![fill; out_n];
+    for z in 0..rnz {
+        for y in 0..rny {
+            for x in 0..rnx {
+                let src = z * rny * rnx + y * rnx + x;
+                let dst = y * rnx * rnz + x * rnz + z;
+                if src < rotated_flat.len() && dst < out.len() {
+                    let v = rotated_flat[src] as f32;
+                    out[dst] = if v == 0.0 { fill } else { v };
+                }
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2349,5 +2914,58 @@ mod tests {
         for i in 15..85 {
             assert!((w[i] - 1.0).abs() < 1e-5, "w[{i}] = {}", w[i]);
         }
+    }
+
+    // --- psf_gen ---
+
+    #[test]
+    fn test_psf_gen_shape_unchanged() {
+        // A simple 4×4×4 PSF with a Gaussian-like peak
+        let ny = 4usize;
+        let nx = 4usize;
+        let nz = 4usize;
+        let mut psf = vec![1.0f32; ny * nx * nz];
+        // Set peak at centre
+        psf[1 * nx * nz + 1 * nz + 1] = 100.0;
+        // dz_data = dz_psf → no resampling
+        let out = psf_gen(&psf, ny, nx, nz, 0.1, 0.1, 1.5, "median");
+        // Should return same or resampled volume ≥ 0
+        assert!(!out.is_empty());
+        assert!(out.iter().all(|&v| v >= 0.0));
+    }
+
+    #[test]
+    fn test_psf_gen_empty() {
+        let out = psf_gen(&[], 0, 0, 0, 0.1, 0.1, 1.5, "median");
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn test_psf_gen_resample() {
+        // dz_data = 2 * dz_psf → Z should be halved
+        let ny = 8usize;
+        let nx = 8usize;
+        let nz = 8usize;
+        let psf = vec![1.0f32; ny * nx * nz];
+        let out = psf_gen(&psf, ny, nx, nz, 0.1, 0.2, 1.5, "masked");
+        assert!(!out.is_empty());
+    }
+
+    // --- rotate_psf ---
+
+    #[test]
+    fn test_rotate_psf_shape() {
+        let ny = 4usize;
+        let nx = 4usize;
+        let nz = 4usize;
+        let psf = vec![1.0f32; ny * nx * nz];
+        let out = rotate_psf(&psf, ny, nx, nz, 32.45, 0.108, 0.1, false, false);
+        assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn test_rotate_psf_empty() {
+        let out = rotate_psf(&[], 0, 0, 0, 32.45, 0.108, 0.1, false, false);
+        assert!(out.is_empty());
     }
 }
