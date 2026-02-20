@@ -1870,6 +1870,920 @@ pub fn photobleach_correction(data: &[f64], n: usize, frames: usize) -> Vec<f64>
     out
 }
 
+// ---------------------------------------------------------------------------
+// 2-D A Trou Wavelet Transform
+// ---------------------------------------------------------------------------
+
+/// Compute the 2-D A Trou Wavelet Transform.
+///
+/// Returns a flat ZYX-major array of shape `rows × cols × (n_bands + 1)`.
+/// Slices `0..n_bands` (axis 2) contain detail coefficients; slice `n_bands`
+/// is the final approximation.  Pass `n_bands = 0` to use the default
+/// `ceil(max(log2(rows), log2(cols)))`.
+///
+/// Perfect reconstruction: `Σ detail_k + approx ≈ original`.
+pub fn awt(data: &[f64], rows: usize, cols: usize, n_bands: usize) -> Vec<f64> {
+    if data.is_empty() || rows == 0 || cols == 0 {
+        return vec![];
+    }
+    let k_max = {
+        let kn = ((rows as f64).log2().max((cols as f64).log2()).ceil() as usize).max(1);
+        kn
+    };
+    let nb = if n_bands == 0 { k_max } else { n_bands.min(k_max) };
+    let slices = nb + 1;
+    let npix = rows * cols;
+    let mut out = vec![0.0f64; npix * slices];
+
+    // Convolve 2-D with dilated [1,4,6,4,1]/16 kernel (separable: rows then cols)
+    let convolve_2d = |src: &[f64], k: usize| -> Vec<f64> {
+        let k1 = 1usize << (k - 1); // 2^(k-1)
+        let k2 = 2 * k1;            // 2^k
+
+        // --- pass 1: convolve along rows ---
+        let mut tmp = vec![0.0f64; npix];
+        for r in 0..rows {
+            for c in 0..cols {
+                let get = |rr: isize| -> f64 {
+                    let ri = rr.clamp(0, (rows - 1) as isize) as usize;
+                    src[ri * cols + c]
+                };
+                let ri = r as isize;
+                tmp[r * cols + c] = (6.0 * get(ri)
+                    + 4.0 * (get(ri + k1 as isize) + get(ri - k1 as isize))
+                    + get(ri + k2 as isize)
+                    + get(ri - k2 as isize))
+                    / 16.0;
+            }
+        }
+        // --- pass 2: convolve along cols ---
+        let mut result = vec![0.0f64; npix];
+        for r in 0..rows {
+            for c in 0..cols {
+                let get = |cc: isize| -> f64 {
+                    let ci = cc.clamp(0, (cols - 1) as isize) as usize;
+                    tmp[r * cols + ci]
+                };
+                let ci = c as isize;
+                result[r * cols + c] = (6.0 * get(ci)
+                    + 4.0 * (get(ci + k1 as isize) + get(ci - k1 as isize))
+                    + get(ci + k2 as isize)
+                    + get(ci - k2 as isize))
+                    / 16.0;
+            }
+        }
+        result
+    };
+
+    let mut last_approx = data.to_vec();
+    for band in 0..nb {
+        let new_approx = convolve_2d(&last_approx, band + 1);
+        for px in 0..npix {
+            out[px * slices + band] = last_approx[px] - new_approx[px]; // detail
+        }
+        last_approx = new_approx;
+    }
+    // Final approximation in last slice
+    for px in 0..npix {
+        out[px * slices + nb] = last_approx[px];
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// A Trou wavelet denoising (2D)
+// ---------------------------------------------------------------------------
+
+/// Denoise a 2-D image via soft thresholding of its A Trou wavelet coefficients.
+///
+/// Detail bands are MAD-thresholded at `n_sigma / norminv(0.75)`.
+/// The final approximation is added back when `include_low_band = true`.
+///
+/// # Arguments
+/// * `data`            — Flat row-major input, length `rows * cols`.
+/// * `rows`, `cols`    — Dimensions.
+/// * `n_bands`         — Wavelet bands (0 = default).
+/// * `include_low_band`— Add final approximation to the reconstruction.
+/// * `n_sigma`         — Threshold multiplier (default 3.0).
+pub fn awt_denoising(
+    data: &[f64],
+    rows: usize,
+    cols: usize,
+    n_bands: usize,
+    include_low_band: bool,
+    n_sigma: f64,
+) -> Vec<f64> {
+    if data.is_empty() || rows == 0 || cols == 0 {
+        return data.to_vec();
+    }
+    let k_max = ((rows as f64).log2().max((cols as f64).log2()).ceil() as usize).max(1);
+    let nb = if n_bands == 0 { k_max } else { n_bands.min(k_max) };
+    let slices = nb + 1;
+    let npix = rows * cols;
+
+    let w = awt(data, rows, cols, nb);
+
+    // norminv(0.75) ≈ 0.6745
+    let norminv_075: f64 = 0.674_489_750_196_082;
+    let mad_factor = n_sigma / norminv_075;
+
+    let mut reconstructed = if include_low_band {
+        // Start from last approximation slice
+        (0..npix).map(|px| w[px * slices + nb]).collect::<Vec<_>>()
+    } else {
+        vec![0.0f64; npix]
+    };
+
+    for band in 0..nb {
+        let coeffs: Vec<f64> = (0..npix).map(|px| w[px * slices + band]).collect();
+        let mut sorted = coeffs.clone();
+        sorted.sort_by(|a, b| a.abs().partial_cmp(&b.abs()).unwrap());
+        let mad_val = {
+            let mid = npix / 2;
+            if npix % 2 == 0 {
+                (sorted[mid - 1].abs() + sorted[mid].abs()) / 2.0
+            } else {
+                sorted[mid].abs()
+            }
+        };
+        let threshold = mad_factor * mad_val;
+        for (px, c) in coeffs.iter().enumerate() {
+            let v = if c.abs() < threshold { 0.0 } else { *c };
+            reconstructed[px] += v;
+        }
+    }
+    reconstructed
+}
+
+// ---------------------------------------------------------------------------
+// B-spline interpolation (1-D, 2-D)
+// ---------------------------------------------------------------------------
+
+/// Helper: mirror boundary for B-spline coefficient index.
+fn mirror_idx(i: isize, n: usize) -> usize {
+    let mut idx = i;
+    let n = n as isize;
+    if idx < 0 { idx = -idx; }
+    if idx >= n { idx = 2 * n - idx - 2; }
+    idx.clamp(0, n - 1) as usize
+}
+
+/// Cubic B-spline basis value `β³(x)` and first+second derivatives.
+///
+/// Returns `(b, db, d2b)` evaluated at scalar `x`.
+fn cubic_bspline_basis(x: f64) -> (f64, f64, f64) {
+    let ax = x.abs();
+    if ax < 1.0 {
+        let b = (4.0 - 6.0 * ax * ax + 3.0 * ax * ax * ax) / 6.0;
+        let db_abs = (-12.0 * ax + 9.0 * ax * ax) / 6.0;
+        let d2b = (-12.0 + 18.0 * ax) / 6.0;
+        let db = db_abs * x.signum();
+        (b, db, d2b)
+    } else if ax < 2.0 {
+        let t = 2.0 - ax;
+        let b = t * t * t / 6.0;
+        let db_abs = -t * t / 2.0;
+        let d2b = t;
+        let db = db_abs * x.signum() * (-1.0); // descending branch: chain-rule sign for (2-|x|)³
+        (b, db, d2b)
+    } else {
+        (0.0, 0.0, 0.0)
+    }
+}
+
+/// Cubic B-spline interpolation for a 1-D signal with first and second derivatives.
+///
+/// # Arguments
+/// * `f`               — Input signal, length `n`.
+/// * `xi`              — Interpolation coordinates (0-based).
+/// * `mirror_boundary` — `true` for mirror BC, `false` for periodic.
+///
+/// # Returns
+/// `(values, first_deriv, second_deriv)` each of length `xi.len()`.
+pub fn binterp_1d(
+    f: &[f64],
+    xi: &[f64],
+    mirror_boundary: bool,
+) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    let n = f.len();
+    if n == 0 || xi.is_empty() {
+        return (vec![], vec![], vec![]);
+    }
+
+    // Compute B-spline coefficients using b3spline_1d
+    let bc = if mirror_boundary { "mirror" } else { "periodic" };
+    let f2d = f.to_vec(); // already 1×n layout
+    let coeffs = match b3spline_1d(&f2d, 1, n, bc) {
+        Ok(c) => c,
+        Err(_) => f.to_vec(),
+    };
+
+    let get_coeff = |i: isize| -> f64 {
+        if mirror_boundary {
+            coeffs[mirror_idx(i, n)]
+        } else {
+            coeffs[(((i % n as isize) + n as isize) % n as isize) as usize]
+        }
+    };
+
+    let mut fi = vec![0.0f64; xi.len()];
+    let mut fi_dx = vec![0.0f64; xi.len()];
+    let mut fi_d2x = vec![0.0f64; xi.len()];
+
+    for (idx, &x) in xi.iter().enumerate() {
+        let xf = x.floor() as isize;
+        let dx = x - xf as f64;
+        // 4-point support: indices xf-1, xf, xf+1, xf+2
+        let distances = [dx + 1.0, dx, dx - 1.0, dx - 2.0];
+        let idxs = [xf - 1, xf, xf + 1, xf + 2];
+        let mut val = 0.0;
+        let mut d1 = 0.0;
+        let mut d2 = 0.0;
+        for (&ii, &dist) in idxs.iter().zip(distances.iter()) {
+            let c = get_coeff(ii);
+            let (b, db, d2b) = cubic_bspline_basis(dist);
+            val += c * b;
+            d1 += c * db;
+            d2 += c * d2b;
+        }
+        fi[idx] = val;
+        fi_dx[idx] = d1;
+        fi_d2x[idx] = d2;
+    }
+    (fi, fi_dx, fi_d2x)
+}
+
+/// Cubic B-spline interpolation for a 2-D image.
+///
+/// # Arguments
+/// * `f`               — Flat row-major input, length `rows * cols`.
+/// * `xi`              — X (column) interpolation coordinates (0-based).
+/// * `yi`              — Y (row) interpolation coordinates (0-based).
+/// * `mirror_boundary` — Boundary condition.
+///
+/// # Returns
+/// `(values, dfdx, dfdy)` each of length `xi.len()`.
+pub fn binterp_2d(
+    f: &[f64],
+    rows: usize,
+    cols: usize,
+    xi: &[f64],
+    yi: &[f64],
+    mirror_boundary: bool,
+) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    if f.is_empty() || xi.is_empty() || xi.len() != yi.len() {
+        return (vec![], vec![], vec![]);
+    }
+
+    // Compute 2-D B-spline coefficients
+    let bc = if mirror_boundary { "mirror" } else { "periodic" };
+    let coeffs = match b3spline_2d(f, rows, cols, bc) {
+        Ok(c) => c,
+        Err(_) => f.to_vec(),
+    };
+
+    let get = |r: isize, c: isize| -> f64 {
+        let ri = if mirror_boundary { mirror_idx(r, rows) } else { (((r % rows as isize) + rows as isize) % rows as isize) as usize };
+        let ci = if mirror_boundary { mirror_idx(c, cols) } else { (((c % cols as isize) + cols as isize) % cols as isize) as usize };
+        coeffs[ri * cols + ci]
+    };
+
+    let n = xi.len();
+    let mut vals = vec![0.0f64; n];
+    let mut dxs = vec![0.0f64; n];
+    let mut dys = vec![0.0f64; n];
+
+    for i in 0..n {
+        let xv = xi[i];
+        let yv = yi[i];
+        let xf = xv.floor() as isize;
+        let yf = yv.floor() as isize;
+        let dx = xv - xf as f64;
+        let dy = yv - yf as f64;
+
+        let x_dist = [dx + 1.0, dx, dx - 1.0, dx - 2.0];
+        let y_dist = [dy + 1.0, dy, dy - 1.0, dy - 2.0];
+        let x_idx = [xf - 1, xf, xf + 1, xf + 2];
+        let y_idx = [yf - 1, yf, yf + 1, yf + 2];
+
+        let mut val = 0.0;
+        let mut dvx = 0.0;
+        let mut dvy = 0.0;
+
+        for (jr, &iy) in y_idx.iter().enumerate() {
+            let (by, dby, _) = cubic_bspline_basis(y_dist[jr]);
+            for (jc, &ix) in x_idx.iter().enumerate() {
+                let (bx, dbx, _) = cubic_bspline_basis(x_dist[jc]);
+                let c = get(iy, ix);
+                val += c * by * bx;
+                dvx += c * by * dbx;
+                dvy += c * dby * bx;
+            }
+        }
+        vals[i] = val;
+        dxs[i] = dvx;
+        dys[i] = dvy;
+    }
+    (vals, dxs, dys)
+}
+
+/// Cubic B-spline interpolation wrapper that dispatches to `binterp_1d` or `binterp_2d`.
+///
+/// Pass `rows = 1` for 1-D signals. The `yi` argument is ignored when `rows == 1`.
+pub fn binterp(
+    f: &[f64],
+    rows: usize,
+    cols: usize,
+    xi: &[f64],
+    yi: &[f64],
+    mirror_boundary: bool,
+) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    if rows <= 1 {
+        binterp_1d(f, xi, mirror_boundary)
+    } else {
+        binterp_2d(f, rows, cols, xi, yi, mirror_boundary)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// N-D FFT-based convolution
+// ---------------------------------------------------------------------------
+
+/// N-D FFT-based convolution of flat 3-D arrays.
+///
+/// Equivalent to `scipy.signal.convolve` with the 'same' or 'full' mode.
+/// Works specifically with 3-D volumes in ZYX order.
+///
+/// # Arguments
+/// * `a`              — First input, length `az * ay * ax`.
+/// * `a_dims`         — `[az, ay, ax]`.
+/// * `b`              — Kernel, length `bz * by * bx`.
+/// * `b_dims`         — `[bz, by, bx]`.
+/// * `mode`           — `"full"`, `"same"`, or `"valid"`.
+///
+/// # Returns
+/// Convolved data (length depends on `mode`).
+pub fn convn_fft(
+    a: &[f64],
+    a_dims: &[usize],
+    b: &[f64],
+    b_dims: &[usize],
+    mode: &str,
+) -> Result<(Vec<f64>, Vec<usize>), ImageProcessingError> {
+    use rustfft::num_complex::Complex;
+    use rustfft::FftPlanner;
+
+    if a_dims.len() != 3 || b_dims.len() != 3 {
+        return Err(ImageProcessingError::InvalidDimensions);
+    }
+    let [az, ay, ax] = [a_dims[0], a_dims[1], a_dims[2]];
+    let [bz, by, bx] = [b_dims[0], b_dims[1], b_dims[2]];
+
+    if a.len() != az * ay * ax || b.len() != bz * by * bx {
+        return Err(ImageProcessingError::InvalidDimensions);
+    }
+
+    // Full convolution dimensions
+    let fz = az + bz - 1;
+    let fy = ay + by - 1;
+    let fx = ax + bx - 1;
+    let fn_ = fz * fy * fx;
+    let fynx = fy * fx;
+    let aynx = ay * ax;
+    let bynx = by * bx;
+
+    // Zero-pad into complex buffers
+    let mut fa: Vec<Complex<f64>> = vec![Complex::new(0.0, 0.0); fn_];
+    let mut fb: Vec<Complex<f64>> = vec![Complex::new(0.0, 0.0); fn_];
+
+    for iz in 0..az {
+        for iy in 0..ay {
+            for ix in 0..ax {
+                fa[iz * fynx + iy * fx + ix] = Complex::new(a[iz * aynx + iy * ax + ix], 0.0);
+            }
+        }
+    }
+    for iz in 0..bz {
+        for iy in 0..by {
+            for ix in 0..bx {
+                fb[iz * fynx + iy * fx + ix] = Complex::new(b[iz * bynx + iy * bx + ix], 0.0);
+            }
+        }
+    }
+
+    // 3-D FFT via separable 1-D FFTs
+    let mut planner = FftPlanner::new();
+
+    // Pre-plan all needed transforms
+    let fft_x_plan = planner.plan_fft_forward(fx);
+    let fft_y_plan = planner.plan_fft_forward(fy);
+    let fft_z_plan = planner.plan_fft_forward(fz);
+    let ifft_x_plan = planner.plan_fft_inverse(fx);
+    let ifft_y_plan = planner.plan_fft_inverse(fy);
+    let ifft_z_plan = planner.plan_fft_inverse(fz);
+
+    // FFT along X for a buffer
+    let do_fft_x = |buf: &mut Vec<Complex<f64>>, plan: &dyn rustfft::Fft<f64>| {
+        for i in 0..fz * fy {
+            plan.process(&mut buf[i * fx..(i + 1) * fx]);
+        }
+    };
+    let do_fft_y = |buf: &mut Vec<Complex<f64>>, plan: &dyn rustfft::Fft<f64>| {
+        let mut col = vec![Complex::new(0.0, 0.0); fy];
+        for iz in 0..fz {
+            for ix in 0..fx {
+                for iy in 0..fy { col[iy] = buf[iz * fynx + iy * fx + ix]; }
+                plan.process(&mut col);
+                for iy in 0..fy { buf[iz * fynx + iy * fx + ix] = col[iy]; }
+            }
+        }
+    };
+    let do_fft_z = |buf: &mut Vec<Complex<f64>>, plan: &dyn rustfft::Fft<f64>| {
+        let mut col = vec![Complex::new(0.0, 0.0); fz];
+        for iy in 0..fy {
+            for ix in 0..fx {
+                for iz in 0..fz { col[iz] = buf[iz * fynx + iy * fx + ix]; }
+                plan.process(&mut col);
+                for iz in 0..fz { buf[iz * fynx + iy * fx + ix] = col[iz]; }
+            }
+        }
+    };
+
+    do_fft_x(&mut fa, fft_x_plan.as_ref());
+    do_fft_y(&mut fa, fft_y_plan.as_ref());
+    do_fft_z(&mut fa, fft_z_plan.as_ref());
+    do_fft_x(&mut fb, fft_x_plan.as_ref());
+    do_fft_y(&mut fb, fft_y_plan.as_ref());
+    do_fft_z(&mut fb, fft_z_plan.as_ref());
+
+    // Multiply
+    for i in 0..fn_ { fa[i] *= fb[i]; }
+
+    do_fft_x(&mut fa, ifft_x_plan.as_ref());
+    do_fft_y(&mut fa, ifft_y_plan.as_ref());
+    do_fft_z(&mut fa, ifft_z_plan.as_ref());
+
+    let scale = fn_ as f64;
+    let full: Vec<f64> = fa.iter().map(|c| c.re / scale).collect();
+
+    // Trim to requested mode
+    let (oz, oy, ox, s_z, s_y, s_x) = match mode {
+        "full" => (fz, fy, fx, 0, 0, 0),
+        "same" => (az, ay, ax, (bz - 1) / 2, (by - 1) / 2, (bx - 1) / 2),
+        "valid" => {
+            let vz = az.saturating_sub(bz) + 1;
+            let vy = ay.saturating_sub(by) + 1;
+            let vx = ax.saturating_sub(bx) + 1;
+            (vz, vy, vx, bz - 1, by - 1, bx - 1)
+        }
+        _ => return Err(ImageProcessingError::InvalidDimensions),
+    };
+
+    let mut out = vec![0.0f64; oz * oy * ox];
+    for z in 0..oz {
+        for y in 0..oy {
+            for x in 0..ox {
+                out[z * oy * ox + y * ox + x] =
+                    full[(z + s_z) * fynx + (y + s_y) * fx + (x + s_x)];
+            }
+        }
+    }
+    Ok((out, vec![oz, oy, ox]))
+}
+
+// ---------------------------------------------------------------------------
+// N-D LoG filter with spatial kernel
+// ---------------------------------------------------------------------------
+
+/// Laplacian-of-Gaussian filter with anisotropic spacing.
+///
+/// Builds a discrete LoG kernel in spatial domain and applies it via
+/// `convn_fft` with 'same' boundary.  Optionally normalises by `σ²`
+/// for scale-normalised responses.
+///
+/// # Arguments
+/// * `data`                        — Flat ZYX input.
+/// * `nz`, `ny`, `nx`              — Volume dimensions.
+/// * `sigma`                       — Gaussian σ in physical units.
+/// * `spacing`                     — Voxel spacing `[sz, sy, sx]` (defaults to 1.0).
+/// * `use_normalized_derivatives`  — Multiply response by `σ²`.
+pub fn filter_log_nd(
+    data: &[f64],
+    nz: usize,
+    ny: usize,
+    nx: usize,
+    sigma: f64,
+    spacing: Option<&[f64]>,
+    use_normalized_derivatives: bool,
+) -> Vec<f64> {
+    if data.is_empty() || sigma <= 0.0 {
+        return data.to_vec();
+    }
+    let sp: [f64; 3] = match spacing {
+        Some(s) if s.len() >= 3 => [s[0], s[1], s[2]],
+        _ => [1.0, 1.0, 1.0],
+    };
+
+    // Build separable LoG kernel: LoG(x,y,z) = (|x/σ|²-1)*G(x)*G(y)*G(z)/σ² + ...
+    // We build it as a full 3-D kernel product
+    let sigma_px = [sigma / sp[0], sigma / sp[1], sigma / sp[2]];
+    let truncate = 3.0;
+
+    let make_1d = |s: f64| -> (Vec<f64>, Vec<f64>) {
+        let w = (truncate * s).ceil() as usize;
+        let size = 2 * w + 1;
+        let mut g = vec![0.0f64; size];
+        let mut log1d = vec![0.0f64; size];
+        let s2 = s * s;
+        for i in 0..size {
+            let x = i as f64 - w as f64;
+            let gv = (-0.5 * x * x / s2).exp();
+            g[i] = gv;
+            log1d[i] = (x * x / s2 - 1.0) / s2 * gv; // LoG1D contribution
+        }
+        let gsum: f64 = g.iter().sum();
+        g.iter_mut().for_each(|v| *v /= gsum);
+        let logsum: f64 = log1d.iter().sum();
+        log1d.iter_mut().for_each(|v| *v -= logsum / size as f64); // zero-mean
+        // Normalise log1d by same factor as g
+        log1d.iter_mut().for_each(|v| *v /= gsum);
+        (g, log1d)
+    };
+
+    let (gz, logz) = make_1d(sigma_px[0]);
+    let (gy, logy) = make_1d(sigma_px[1]);
+    let (gx, logx) = make_1d(sigma_px[2]);
+
+    let wz = gz.len();
+    let wy = gy.len();
+    let wx = gx.len();
+
+    // LoG = ∂²/∂z² + ∂²/∂y² + ∂²/∂x²
+    // = logz⊗gy⊗gx + gz⊗logy⊗gx + gz⊗gy⊗logx
+    let build_kernel = |kz: &[f64], ky: &[f64], kx: &[f64]| -> Vec<f64> {
+        let mut k = vec![0.0f64; wz * wy * wx];
+        for iz in 0..wz {
+            for iy in 0..wy {
+                for ix in 0..wx {
+                    k[iz * wy * wx + iy * wx + ix] = kz[iz] * ky[iy] * kx[ix];
+                }
+            }
+        }
+        k
+    };
+
+    let k1 = build_kernel(&logz, &gy, &gx);
+    let k2 = build_kernel(&gz, &logy, &gx);
+    let k3 = build_kernel(&gz, &gy, &logx);
+
+    let mut kernel = vec![0.0f64; wz * wy * wx];
+    for i in 0..kernel.len() { kernel[i] = k1[i] + k2[i] + k3[i]; }
+
+    // Convolve using convn_fft 'same'
+    let result = convn_fft(
+        data,
+        &[nz, ny, nx],
+        &kernel,
+        &[wz, wy, wx],
+        "same",
+    ).map(|(d, _)| d)
+     .unwrap_or_else(|_| data.to_vec());
+
+    if use_normalized_derivatives {
+        result.iter().map(|&v| v * sigma * sigma).collect()
+    } else {
+        result
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Directional distance transform (2-D)
+// ---------------------------------------------------------------------------
+
+/// Compute directional distance from each `false` pixel to the nearest `true`
+/// pixel in 4 cardinal directions.
+///
+/// Returns a flat array of length `rows * cols * 4`.  Slice `k` (0-3) gives:
+/// - 0: distance increasing-row (down)
+/// - 1: distance decreasing-row (up)
+/// - 2: distance increasing-col (right)
+/// - 3: distance decreasing-col (left)
+pub fn bw_max_direct_dist(mask: &[bool], rows: usize, cols: usize) -> Vec<f32> {
+    if mask.is_empty() || rows == 0 || cols == 0 {
+        return vec![];
+    }
+    let n = rows * cols;
+    let inf = rows.max(cols) as f32 + 1.0;
+    let mut out = vec![inf; n * 4];
+
+    // Direction 0: down (increasing row)
+    for r in 1..rows {
+        for c in 0..cols {
+            if !mask[r * cols + c] {
+                out[r * cols + c] = out[(r - 1) * cols + c] + 1.0;
+            } else {
+                out[r * cols + c] = 0.0;
+            }
+        }
+    }
+    for c in 0..cols {
+        out[c] = if mask[c] { 0.0 } else { inf };
+    }
+
+    // Direction 1: up (decreasing row)
+    let off = n;
+    for r in (0..rows - 1).rev() {
+        for c in 0..cols {
+            if !mask[r * cols + c] {
+                out[off + r * cols + c] = out[off + (r + 1) * cols + c] + 1.0;
+            } else {
+                out[off + r * cols + c] = 0.0;
+            }
+        }
+    }
+    for c in 0..cols {
+        out[off + (rows - 1) * cols + c] = if mask[(rows - 1) * cols + c] { 0.0 } else { inf };
+    }
+
+    // Direction 2: right (increasing col)
+    let off = 2 * n;
+    for r in 0..rows {
+        for c in 1..cols {
+            if !mask[r * cols + c] {
+                out[off + r * cols + c] = out[off + r * cols + c - 1] + 1.0;
+            } else {
+                out[off + r * cols + c] = 0.0;
+            }
+        }
+        out[off + r * cols] = if mask[r * cols] { 0.0 } else { inf };
+    }
+
+    // Direction 3: left (decreasing col)
+    let off = 3 * n;
+    for r in 0..rows {
+        for c in (0..cols - 1).rev() {
+            if !mask[r * cols + c] {
+                out[off + r * cols + c] = out[off + r * cols + c + 1] + 1.0;
+            } else {
+                out[off + r * cols + c] = 0.0;
+            }
+        }
+        out[off + r * cols + cols - 1] = if mask[r * cols + cols - 1] { 0.0 } else { inf };
+    }
+
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Neighbor count for binary images
+// ---------------------------------------------------------------------------
+
+/// Count the number of `true` neighbors of each element in a flat 2-D binary
+/// image using the supplied neighborhood mask.
+///
+/// `neighborhood` is a flat `k×k` boolean mask (must be odd-sized, centre is
+/// ignored). Defaults to 8-connectivity (3×3 all-true, centre excluded).
+pub fn bw_n_neighbors(mask: &[bool], rows: usize, cols: usize, neighborhood: Option<&[bool]>) -> Vec<u8> {
+    if mask.is_empty() {
+        return vec![];
+    }
+    // Default: 8-connectivity 3×3
+    let default_hood = [true; 9];
+    let hood = neighborhood.unwrap_or(&default_hood);
+    let ksize = ((hood.len() as f64).sqrt().round() as usize).max(1);
+    let kh = ksize / 2;
+
+    let mut out = vec![0u8; rows * cols];
+    for r in 0..rows {
+        for c in 0..cols {
+            if !mask[r * cols + c] {
+                continue;
+            }
+            let mut cnt = 0u8;
+            for kr in 0..ksize {
+                for kc in 0..ksize {
+                    if kr == kh && kc == kh { continue; } // skip centre
+                    if !hood[kr * ksize + kc] { continue; }
+                    let nr = r as isize + kr as isize - kh as isize;
+                    let nc = c as isize + kc as isize - kh as isize;
+                    if nr >= 0 && nr < rows as isize && nc >= 0 && nc < cols as isize {
+                        if mask[nr as usize * cols + nc as usize] { cnt += 1; }
+                    }
+                }
+            }
+            out[r * cols + c] = cnt;
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Mask vectors / angle filter
+// ---------------------------------------------------------------------------
+
+/// Return a boolean mask indicating which (x, y) points lie inside a 2-D
+/// binary mask (1-based MATLAB-style coordinates).
+///
+/// Points outside image bounds are marked `false`.
+pub fn mask_vectors(x_coords: &[f64], y_coords: &[f64], mask: &[bool], rows: usize, cols: usize) -> Vec<bool> {
+    let n = x_coords.len().min(y_coords.len());
+    let mut out = vec![false; n];
+    for i in 0..n {
+        // MATLAB convention: disp_mat_x → row index, disp_mat_y → col index
+        let row = x_coords[i].round() as isize;
+        let col = y_coords[i].round() as isize;
+        if row > 0 && row <= rows as isize && col > 0 && col <= cols as isize {
+            if mask[(row - 1) as usize * cols + (col - 1) as usize] {
+                out[i] = true;
+            }
+        }
+    }
+    out
+}
+
+/// Filter vectors by angle from a reference direction.
+///
+/// Returns `true` for vectors within `±π/3` radians of `vec_mid`.
+///
+/// # Arguments
+/// * `vec_x`, `vec_y` — Vector components.
+/// * `ref_x`, `ref_y` — Reference direction.
+pub fn angle_filter(vec_x: &[f64], vec_y: &[f64], ref_x: f64, ref_y: f64) -> Vec<bool> {
+    let n = vec_x.len().min(vec_y.len());
+    let mut out = vec![false; n];
+    let ref_angle = ref_y.atan2(ref_x);
+    let threshold = std::f64::consts::PI / 3.0;
+    for i in 0..n {
+        let angle = vec_y[i].atan2(vec_x[i]);
+        let diff = (angle - ref_angle + std::f64::consts::PI).rem_euclid(2.0 * std::f64::consts::PI) - std::f64::consts::PI;
+        out[i] = diff.abs() <= threshold;
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Color utilities
+// ---------------------------------------------------------------------------
+
+/// Compose an RGB image (rows×cols×3, u8) from up to three grayscale channels.
+///
+/// Each channel is independently contrast-stretched to `[0, 255]`.
+/// Pass `None` to fill that channel with zeros.
+pub fn ch2rgb(
+    r_chan: Option<&[f64]>,
+    g_chan: Option<&[f64]>,
+    b_chan: Option<&[f64]>,
+    rows: usize,
+    cols: usize,
+) -> Vec<u8> {
+    let npix = rows * cols;
+    let scale_chan = |ch: Option<&[f64]>| -> Vec<u8> {
+        match ch {
+            None => vec![0u8; npix],
+            Some(c) => {
+                let mn = c.iter().cloned().fold(f64::INFINITY, f64::min);
+                let mx = c.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                if (mx - mn).abs() < 1e-12 {
+                    vec![0u8; npix]
+                } else {
+                    c.iter().map(|&v| ((v - mn) / (mx - mn) * 255.0).round().clamp(0.0, 255.0) as u8).collect()
+                }
+            }
+        }
+    };
+    let r = scale_chan(r_chan);
+    let g = scale_chan(g_chan);
+    let b = scale_chan(b_chan);
+    let mut out = vec![0u8; npix * 3];
+    for i in 0..npix {
+        out[i * 3] = r[i];
+        out[i * 3 + 1] = g[i];
+        out[i * 3 + 2] = b[i];
+    }
+    out
+}
+
+/// Overlay coloured masks on a grayscale image.
+///
+/// `colors` is a list of `(r, g, b)` in `[0, 1]`. Each mask's nonzero pixels
+/// replace the grayscale with the corresponding colour.
+///
+/// Returns a flat `rows×cols×3` u8 RGB image.
+pub fn rgb_overlay(
+    img: &[f64],
+    rows: usize,
+    cols: usize,
+    masks: &[&[bool]],
+    colors: &[(f64, f64, f64)],
+) -> Vec<u8> {
+    let npix = rows * cols;
+    if img.is_empty() || npix == 0 {
+        return vec![];
+    }
+    // Normalise grayscale to [0,1]
+    let mn = img.iter().cloned().fold(f64::INFINITY, f64::min);
+    let mx = img.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let scaled: Vec<f64> = if (mx - mn).abs() < 1e-12 {
+        vec![0.0; npix]
+    } else {
+        img.iter().map(|&v| (v - mn) / (mx - mn)).collect()
+    };
+
+    let mut rgb = vec![(0.0f64, 0.0f64, 0.0f64); npix];
+    for i in 0..npix {
+        rgb[i] = (scaled[i], scaled[i], scaled[i]);
+    }
+
+    for (mask, &(cr, cg, cb)) in masks.iter().zip(colors.iter()) {
+        for i in 0..npix.min(mask.len()) {
+            if mask[i] {
+                rgb[i].0 = (rgb[i].0 + cr).min(1.0);
+                rgb[i].1 = (rgb[i].1 + cg).min(1.0);
+                rgb[i].2 = (rgb[i].2 + cb).min(1.0);
+            }
+        }
+    }
+
+    let mut out = vec![0u8; npix * 3];
+    for i in 0..npix {
+        out[i * 3] = (rgb[i].0 * 255.0).round().clamp(0.0, 255.0) as u8;
+        out[i * 3 + 1] = (rgb[i].1 * 255.0).round().clamp(0.0, 255.0) as u8;
+        out[i * 3 + 2] = (rgb[i].2 * 255.0).round().clamp(0.0, 255.0) as u8;
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Z-projection
+// ---------------------------------------------------------------------------
+
+/// Z-projection of a 3-D volume.
+///
+/// Projects along axis 0 (Z).
+///
+/// # Arguments
+/// * `data`        — Flat ZYX input, length `nz * ny * nx`.
+/// * `proj_type`   — `"max"`, `"mean"`, `"median"`, or `"min"`.
+///
+/// # Returns
+/// `(projected, [ny, nx])`.
+pub fn z_proj_image(
+    data: &[f64],
+    nz: usize,
+    ny: usize,
+    nx: usize,
+    proj_type: &str,
+) -> Result<Vec<f64>, ImageProcessingError> {
+    if data.len() != nz * ny * nx {
+        return Err(ImageProcessingError::InvalidDimensions);
+    }
+    if nz == 0 || ny == 0 || nx == 0 {
+        return Ok(vec![]);
+    }
+    let nynx = ny * nx;
+    let mut out = vec![0.0f64; nynx];
+
+    match proj_type {
+        "max" => {
+            for i in 0..nynx { out[i] = f64::NEG_INFINITY; }
+            for z in 0..nz {
+                for i in 0..nynx {
+                    let v = data[z * nynx + i];
+                    if v > out[i] { out[i] = v; }
+                }
+            }
+        }
+        "min" => {
+            for i in 0..nynx { out[i] = f64::INFINITY; }
+            for z in 0..nz {
+                for i in 0..nynx {
+                    let v = data[z * nynx + i];
+                    if v < out[i] { out[i] = v; }
+                }
+            }
+        }
+        "mean" | "ave" | "average" => {
+            for z in 0..nz {
+                for i in 0..nynx { out[i] += data[z * nynx + i]; }
+            }
+            for v in out.iter_mut() { *v /= nz as f64; }
+        }
+        "median" | "med" => {
+            for i in 0..nynx {
+                let mut col: Vec<f64> = (0..nz).map(|z| data[z * nynx + i]).collect();
+                col.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                out[i] = if nz % 2 == 0 {
+                    (col[nz / 2 - 1] + col[nz / 2]) / 2.0
+                } else {
+                    col[nz / 2]
+                };
+            }
+        }
+        _ => return Err(ImageProcessingError::InvalidDimensions),
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2283,5 +3197,252 @@ mod tests {
         for v in &out[..100] {
             assert!((v - 5.0).abs() < 1e-6, "constant correction: {v}");
         }
+    }
+
+    // --- awt (2D) ---
+
+    #[test]
+    fn test_awt_2d_shape() {
+        let data = vec![1.0f64; 64 * 64];
+        let n_bands = 4;
+        let out = awt(&data, 64, 64, n_bands);
+        assert_eq!(out.len(), 64 * 64 * (n_bands + 1));
+    }
+
+    #[test]
+    fn test_awt_2d_reconstruction() {
+        use std::f64::consts::PI;
+        let rows = 32usize;
+        let cols = 32usize;
+        let data: Vec<f64> = (0..rows * cols)
+            .map(|i| (i as f64 * 0.1 * PI).sin())
+            .collect();
+        let n_bands = 3;
+        let out = awt(&data, rows, cols, n_bands);
+        let slices = n_bands + 1;
+        for px in 0..rows * cols {
+            let reconstructed: f64 = (0..slices).map(|k| out[px * slices + k]).sum();
+            assert!(
+                (reconstructed - data[px]).abs() < 1e-9,
+                "AWT 2D recon error at {px}: {reconstructed} vs {}",
+                data[px]
+            );
+        }
+    }
+
+    // --- awt_denoising ---
+
+    #[test]
+    fn test_awt_denoising_shape() {
+        let data = vec![1.0f64; 100]; // 10×10
+        let out = awt_denoising(&data, 10, 10, 3, true, 3.0);
+        assert_eq!(out.len(), 100);
+    }
+
+    #[test]
+    fn test_awt_denoising_uniform() {
+        // Denoising a perfectly uniform image should return same values
+        let data = vec![5.0f64; 64]; // 8×8
+        let out = awt_denoising(&data, 8, 8, 2, true, 3.0);
+        for v in &out {
+            assert!((v - 5.0).abs() < 1e-6, "denoised uniform: {v}");
+        }
+    }
+
+    // --- binterp_1d ---
+
+    #[test]
+    fn test_binterp_1d_exact_nodes() {
+        // Interpolating at an interior integer node should return the original value
+        let f = vec![0.0, 1.0, 4.0, 9.0, 16.0, 25.0, 36.0];
+        // Test at interior nodes (avoid boundaries where mirror BC causes deviations)
+        let xi: Vec<f64> = vec![2.0, 3.0, 4.0];
+        let (vals, _, _) = binterp_1d(&f, &xi, true);
+        for (i, &v) in vals.iter().enumerate() {
+            let expected = f[xi[i] as usize];
+            assert!((v - expected).abs() < 1e-4, "binterp1d at {}: {v} vs {expected}", xi[i]);
+        }
+    }
+
+    // --- binterp_2d ---
+
+    #[test]
+    fn test_binterp_2d_exact_nodes() {
+        let rows = 5usize;
+        let cols = 5usize;
+        let f: Vec<f64> = (0..25).map(|i| i as f64).collect();
+        // Test at one interior node (2,2) → f[2*5+2] = 12
+        let xi = vec![2.0]; // column
+        let yi = vec![2.0]; // row
+        let (vals, _, _) = binterp_2d(&f, rows, cols, &xi, &yi, true);
+        let expected = f[2 * 5 + 2];
+        assert!(
+            (vals[0] - expected).abs() < 1e-3,
+            "binterp2d interior: {} vs {expected}",
+            vals[0]
+        );
+    }
+
+    // --- convn_fft ---
+
+    #[test]
+    fn test_convn_fft_same_shape() {
+        let a = vec![1.0f64; 8 * 8 * 8];
+        let b = vec![1.0f64; 3 * 3 * 3]; // box kernel
+        let (out, dims) = convn_fft(&a, &[8, 8, 8], &b, &[3, 3, 3], "same").unwrap();
+        assert_eq!(dims, vec![8, 8, 8]);
+        assert_eq!(out.len(), 512);
+    }
+
+    #[test]
+    fn test_convn_fft_full_shape() {
+        let a = vec![1.0f64; 4 * 4 * 4];
+        let b = vec![1.0f64; 3 * 3 * 3];
+        let (out, dims) = convn_fft(&a, &[4, 4, 4], &b, &[3, 3, 3], "full").unwrap();
+        assert_eq!(dims, vec![6, 6, 6]);
+        assert_eq!(out.len(), 216);
+    }
+
+    // --- filter_log_nd ---
+
+    #[test]
+    fn test_filter_log_nd_shape() {
+        let data = vec![1.0f64; 125]; // 5×5×5
+        let out = filter_log_nd(&data, 5, 5, 5, 1.0, None, false);
+        assert_eq!(out.len(), 125);
+    }
+
+    // --- bw_max_direct_dist ---
+
+    #[test]
+    fn test_bw_max_direct_dist_shape() {
+        let mask = vec![true; 100]; // 10×10
+        let out = bw_max_direct_dist(&mask, 10, 10);
+        assert_eq!(out.len(), 400); // 10×10×4
+    }
+
+    #[test]
+    fn test_bw_max_direct_dist_all_true() {
+        let mask = vec![true; 25]; // 5×5
+        let out = bw_max_direct_dist(&mask, 5, 5);
+        // All distances should be 0 (every pixel is true)
+        for v in &out {
+            assert_eq!(*v, 0.0f32);
+        }
+    }
+
+    // --- bw_n_neighbors ---
+
+    #[test]
+    fn test_bw_n_neighbors_full_mask() {
+        let mask = vec![true; 25]; // 5×5 all true
+        let out = bw_n_neighbors(&mask, 5, 5, None);
+        // Interior pixels have 8 neighbors, all true
+        assert_eq!(out[12], 8); // centre (2,2)
+    }
+
+    #[test]
+    fn test_bw_n_neighbors_empty_mask() {
+        let mask = vec![false; 25];
+        let out = bw_n_neighbors(&mask, 5, 5, None);
+        assert!(out.iter().all(|&v| v == 0));
+    }
+
+    // --- mask_vectors ---
+
+    #[test]
+    fn test_mask_vectors_inside() {
+        let mask = vec![true; 100]; // 10×10
+        let x = vec![5.0, 3.0];
+        let y = vec![5.0, 3.0];
+        let out = mask_vectors(&x, &y, &mask, 10, 10);
+        assert!(out.iter().all(|&v| v));
+    }
+
+    #[test]
+    fn test_mask_vectors_outside_bounds() {
+        let mask = vec![true; 100];
+        let x = vec![0.0, 11.0];
+        let y = vec![0.0, 11.0];
+        let out = mask_vectors(&x, &y, &mask, 10, 10);
+        assert!(!out[0] && !out[1]);
+    }
+
+    // --- angle_filter ---
+
+    #[test]
+    fn test_angle_filter_same_direction() {
+        // Vectors pointing same direction as reference should pass
+        let vx = vec![1.0, 0.9];
+        let vy = vec![0.0, 0.1];
+        let out = angle_filter(&vx, &vy, 1.0, 0.0);
+        assert!(out.iter().all(|&v| v));
+    }
+
+    #[test]
+    fn test_angle_filter_opposite_direction() {
+        // Vectors pointing opposite direction should fail
+        let vx = vec![-1.0];
+        let vy = vec![0.0];
+        let out = angle_filter(&vx, &vy, 1.0, 0.0);
+        assert!(!out[0]);
+    }
+
+    // --- ch2rgb ---
+
+    #[test]
+    fn test_ch2rgb_shape() {
+        let r = vec![100.0f64; 100];
+        let g = vec![150.0f64; 100];
+        let out = ch2rgb(Some(&r), Some(&g), None, 10, 10);
+        assert_eq!(out.len(), 300); // 10×10×3
+    }
+
+    #[test]
+    fn test_ch2rgb_zero_channel() {
+        let r = vec![1.0f64; 4];
+        let out = ch2rgb(Some(&r), None, None, 2, 2);
+        // G and B channels should be 0
+        for i in 0..4 {
+            assert_eq!(out[i * 3 + 1], 0u8);
+            assert_eq!(out[i * 3 + 2], 0u8);
+        }
+    }
+
+    // --- rgb_overlay ---
+
+    #[test]
+    fn test_rgb_overlay_shape() {
+        let img = vec![1.0f64; 100];
+        let mask = vec![false; 100];
+        let out = rgb_overlay(&img, 10, 10, &[&mask], &[(1.0, 0.0, 0.0)]);
+        assert_eq!(out.len(), 300);
+    }
+
+    // --- z_proj_image ---
+
+    #[test]
+    fn test_z_proj_max() {
+        let mut data = vec![0.0f64; 4 * 3 * 3]; // 4×3×3
+        data[0 * 9 + 4] = 5.0;
+        data[3 * 9 + 4] = 10.0;
+        let out = z_proj_image(&data, 4, 3, 3, "max").unwrap();
+        assert_eq!(out.len(), 9);
+        assert!((out[4] - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_z_proj_mean() {
+        let data = vec![4.0f64; 4 * 9]; // 4×3×3 all 4
+        let out = z_proj_image(&data, 4, 3, 3, "mean").unwrap();
+        for v in &out {
+            assert!((v - 4.0).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn test_z_proj_invalid_type() {
+        let data = vec![1.0f64; 8];
+        assert!(z_proj_image(&data, 2, 2, 2, "unknown_type").is_err());
     }
 }

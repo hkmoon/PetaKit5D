@@ -27,12 +27,14 @@ pub mod utils;
 // between the two, or import each module directly.
 
 pub use image_processing::{
-    awt_1d, b3spline_1d, b3spline_2d, bilateral_filter, binary_sphere, bw_largest_obj,
-    bwn_hood_3d, compute_bspline_coefficients, conv3_fast, fast_gauss_3d, filter_gauss_1d,
-    filter_gauss_2d, filter_gauss_3d, filter_log, gradient_filter_gauss_2d,
-    gradient_filter_gauss_3d, invert_contrast, local_avg_std_2d, non_maximum_suppression,
-    non_maximum_suppression_3d, photobleach_correction, scale_contrast, surface_filter_gauss_3d,
-    threshold_rosin, ImageProcessingError,
+    angle_filter, awt, awt_1d, awt_denoising, b3spline_1d, b3spline_2d, bilateral_filter,
+    binterp, binterp_1d, binterp_2d, binary_sphere, bw_largest_obj, bw_max_direct_dist,
+    bw_n_neighbors, bwn_hood_3d, ch2rgb, compute_bspline_coefficients, conv3_fast, convn_fft,
+    fast_gauss_3d, filter_gauss_1d, filter_gauss_2d, filter_gauss_3d, filter_log, filter_log_nd,
+    gradient_filter_gauss_2d, gradient_filter_gauss_3d, invert_contrast, local_avg_std_2d,
+    mask_vectors, non_maximum_suppression, non_maximum_suppression_3d, photobleach_correction,
+    rgb_overlay, scale_contrast, surface_filter_gauss_3d, threshold_rosin, z_proj_image,
+    ImageProcessingError,
 };
 pub use io::{
     read_tiff,
@@ -50,12 +52,16 @@ pub use microscope_data_processing::{
     decon_otf2psf,
     decon_psf2otf,
     deskew_frame_3d,
+    distance_weight_single_axis,
     erode_volume_by_2d_projection,
     estimate_computing_memory,
     group_partial_volume_files,
     imresize3_average,
     integral_image_3d,
     max_pooling_3d,
+    min_bbox_3d,
+    normalize_z_stack,
+    process_flatfield_correction_frame,
     project_3d_to_2d,
     resample_stack_3d,
     rotate_frame_3d,
@@ -72,7 +78,7 @@ pub use point_detection::{
 };
 pub use stitch::{
     check_major_tile_valid, check_slurm_cluster, feather_blending_3d,
-    feather_distance_map_resize_3d, normxcorr2_max_shift, normxcorr3_fast,
+    feather_distance_map_resize_3d, normxcorr2_max_shift, normxcorr3_fast, normxcorr3_max_shift,
     stitch_process_filenames, StitchingError,
 };
 pub use utils::{

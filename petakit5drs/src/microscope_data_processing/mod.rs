@@ -1555,6 +1555,273 @@ pub fn decon_mask_edge_erosion(
     out
 }
 
+// ---------------------------------------------------------------------------
+// Min value inside 3-D bounding box
+// ---------------------------------------------------------------------------
+
+/// Return the minimum value inside a 3-D bounding box.
+///
+/// # Arguments
+/// * `data`       — Flat ZYX input, length `nz * ny * nx`.
+/// * `nz`,`ny`,`nx`— Volume dimensions.
+/// * `bbox`       — `[z_start, y_start, x_start, z_end, y_end, x_end]`
+///                  (1-based MATLAB indexing, inclusive).
+pub fn min_bbox_3d(
+    data: &[f64],
+    nz: usize,
+    ny: usize,
+    nx: usize,
+    bbox: &[usize],
+) -> f64 {
+    if bbox.len() < 6 || data.is_empty() {
+        return 0.0;
+    }
+    let (zs, ys, xs) = (bbox[0].saturating_sub(1), bbox[1].saturating_sub(1), bbox[2].saturating_sub(1));
+    let (ze, ye, xe) = (bbox[3].min(nz), bbox[4].min(ny), bbox[5].min(nx));
+    let mut min_val = f64::INFINITY;
+    for z in zs..ze {
+        for y in ys..ye {
+            for x in xs..xe {
+                let v = data[z * ny * nx + y * nx + x];
+                if v < min_val { min_val = v; }
+            }
+        }
+    }
+    if min_val == f64::INFINITY { 0.0 } else { min_val }
+}
+
+// ---------------------------------------------------------------------------
+// Flat-field correction
+// ---------------------------------------------------------------------------
+
+/// Apply flat-field and background correction to a microscopy frame.
+///
+/// The correction formula is:
+/// `corrected = (frame - background) / ls_mask`
+/// where `ls_mask` is processed from the light-sheet illumination pattern.
+///
+/// # Arguments
+/// * `frame`                   — Input frame, flat ZYX (or YX for 2D).
+/// * `ny`, `nx`                — Frame dimensions.
+/// * `ls_image`                — Light-sheet illumination image, length `ls_ny*ls_nx`.
+/// * `ls_ny`, `ls_nx`          — LS image dimensions.
+/// * `bg_image`                — Background image, length `bg_ny*bg_nx`.
+/// * `bg_ny`, `bg_nx`          — Background dimensions.
+/// * `const_offset`            — If `Some(v)`, add `v` instead of background after division.
+/// * `lower_limit`             — Minimum allowed value for the LS mask (default 0.4).
+pub fn process_flatfield_correction_frame(
+    frame: &[f64],
+    ny: usize,
+    nx: usize,
+    ls_image: &[f64],
+    ls_ny: usize,
+    ls_nx: usize,
+    bg_image: &[f64],
+    bg_ny: usize,
+    bg_nx: usize,
+    const_offset: Option<f64>,
+    lower_limit: f64,
+) -> Vec<f64> {
+    if frame.is_empty() || ny == 0 || nx == 0 {
+        return frame.to_vec();
+    }
+
+    // Crop LS image to frame size (centre crop)
+    let crop2d = |src: &[f64], sny: usize, snx: usize| -> Vec<f64> {
+        if sny == ny && snx == nx {
+            return src.to_vec();
+        }
+        let dz = ((sny as isize - ny as isize) / 2).max(0) as usize;
+        let dx = ((snx as isize - nx as isize) / 2).max(0) as usize;
+        let mut out = vec![0.0f64; ny * nx];
+        for r in 0..ny {
+            for c in 0..nx {
+                let sr = r + dz;
+                let sc = c + dx;
+                if sr < sny && sc < snx {
+                    out[r * nx + c] = src[sr * snx + sc];
+                }
+            }
+        }
+        out
+    };
+
+    let ls_cropped = crop2d(ls_image, ls_ny, ls_nx);
+    let bg_cropped = crop2d(bg_image, bg_ny, bg_nx);
+
+    // Compute LS mask: clip to lower_limit
+    let ls_max = ls_cropped.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let ls_max = if ls_max <= 0.0 { 1.0 } else { ls_max };
+    let ls_mask: Vec<f64> = ls_cropped.iter().map(|&v| (v / ls_max).max(lower_limit)).collect();
+
+    // Determine background offset
+    let bg_offset = match const_offset {
+        Some(v) => v,
+        None => {
+            let bg_mean: f64 = bg_cropped.iter().sum::<f64>() / bg_cropped.len().max(1) as f64;
+            bg_mean
+        }
+    };
+
+    // Apply correction
+    let nz = frame.len() / (ny * nx).max(1);
+    let mut out = vec![0.0f64; frame.len()];
+    for plane in 0..nz {
+        for r in 0..ny {
+            for c in 0..nx {
+                let idx = plane * ny * nx + r * nx + c;
+                let bg = bg_cropped.get(r * nx + c).copied().unwrap_or(0.0);
+                let corrected = (frame[idx] - bg) / ls_mask[r * nx + c] + bg_offset;
+                out[idx] = corrected.max(0.0);
+            }
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Normalize Z stack
+// ---------------------------------------------------------------------------
+
+/// Normalize intensity across Z slices using median-based scaling.
+///
+/// Computes median intensity per slice (above threshold 105), scales
+/// each slice by `global_median / slice_median`, clamped within ±10.
+///
+/// # Arguments
+/// * `data`         — Flat YXZ input (Y×X×Z order).
+/// * `ny`, `nx`, `nz`— Dimensions.
+pub fn normalize_z_stack(data: &[f64], ny: usize, nx: usize, nz: usize) -> Vec<f64> {
+    if data.is_empty() || nz == 0 {
+        return data.to_vec();
+    }
+    // Background threshold (camera offset); slices below this are ignored
+    let bg: f64 = 105.0;
+    // Max allowed deviation of a per-slice median from the global median
+    let spd: f64 = 10.0;
+    let nynx = ny * nx;
+
+    // Compute per-slice median above threshold
+    let mut meds: Vec<f64> = vec![f64::NAN; nz];
+    for z in 0..nz {
+        let mut pos_vals: Vec<f64> = (0..nynx)
+            .filter_map(|i| {
+                let v = data[i * nz + z] - bg; // YXZ layout
+                if v > 0.0 { Some(v) } else { None }
+            })
+            .collect();
+        if !pos_vals.is_empty() {
+            pos_vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let mid = pos_vals.len() / 2;
+            meds[z] = if pos_vals.len() % 2 == 0 {
+                (pos_vals[mid - 1] + pos_vals[mid]) / 2.0
+            } else {
+                pos_vals[mid]
+            };
+        }
+    }
+
+    // Global median (ignore NaN)
+    let valid: Vec<f64> = meds.iter().copied().filter(|v| v.is_finite()).collect();
+    if valid.is_empty() {
+        return data.to_vec();
+    }
+    let mut vs = valid.clone();
+    vs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let m = if vs.len() % 2 == 0 {
+        (vs[vs.len() / 2 - 1] + vs[vs.len() / 2]) / 2.0
+    } else {
+        vs[vs.len() / 2]
+    };
+
+    // Clamp and normalise
+    let nn: Vec<f64> = meds.iter().map(|&v| {
+        let vv = if v.is_nan() { m } else { v };
+        let vv = vv.clamp(m - spd, m + spd);
+        vv
+    }).collect();
+    let max_nn = nn.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let scale: Vec<f64> = nn.iter().map(|&v| if max_nn > 0.0 { v / max_nn } else { 1.0 }).collect();
+
+    let mut out = data.to_vec();
+    for z in 0..nz {
+        if scale[z] == 0.0 { continue; }
+        for i in 0..nynx {
+            out[i * nz + z] /= scale[z];
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Distance weight for blending
+// ---------------------------------------------------------------------------
+
+/// Compute Hann-window blending weights for one axis.
+///
+/// # Arguments
+/// * `sz`          — Length of the axis.
+/// * `start`, `end`— Active region, 1-based inclusive (MATLAB convention).
+/// * `buffer_size` — Width of the cosine ramp.
+/// * `dfactor`     — Exponential decay outside ramp (0 = no decay).
+///
+/// # Returns
+/// Float32 weight vector of length `sz`.
+pub fn distance_weight_single_axis(
+    sz: usize,
+    start: usize,
+    end: usize,
+    buffer_size: usize,
+    dfactor: f64,
+) -> Vec<f32> {
+    let mut w = vec![1.0f32; sz];
+    let s = start.saturating_sub(1).min(sz.saturating_sub(1));
+    let t = end.saturating_sub(1).min(sz.saturating_sub(1));
+
+    if s == 0 && t == sz.saturating_sub(1) {
+        return w;
+    }
+
+    // Zero outside [s, t]
+    for v in &mut w[..s] { *v = 0.0; }
+    for v in &mut w[t + 1..] { *v = 0.0; }
+
+    // Hann window ramp at start
+    for i in 0..=buffer_size.min(s) {
+        let x = i as f64;
+        let y = buffer_size as f64;
+        let hw = (0.5 * std::f64::consts::PI * x / y.max(1.0)).cos().powi(2);
+        let idx = s - (buffer_size.min(s) - i);
+        if idx < sz { w[idx] = hw.max(1e-3) as f32; }
+    }
+
+    // Hann window ramp at end
+    for i in 0..=buffer_size.min(sz.saturating_sub(t + 1)) {
+        let x = i as f64;
+        let y = buffer_size as f64;
+        let hw = (0.5 * std::f64::consts::PI * x / y.max(1.0)).cos().powi(2);
+        let idx = t + (buffer_size.min(sz.saturating_sub(t + 1)) - i);
+        if idx < sz { w[idx] = hw.max(1e-3) as f32; }
+    }
+
+    // Exponential decay before start ramp
+    if dfactor > 0.0 {
+        let exp_start = s.saturating_sub(buffer_size);
+        for i in (0..exp_start).rev() {
+            let dist = (exp_start - i) as f64;
+            w[i] = (dfactor.powf(dist) as f32).max(1e-4);
+        }
+        // Decay after end ramp
+        let exp_end = (t + buffer_size + 1).min(sz);
+        for i in exp_end..sz {
+            let dist = (i - exp_end + 1) as f64;
+            w[i] = (dfactor.powf(dist) as f32).max(1e-4);
+        }
+    }
+
+    w
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2008,5 +2275,79 @@ mod tests {
         let out = decon_mask_edge_erosion(&mask, 3, 3, 3, 1);
         // Centre should be removed because some neighbours are false
         assert!(!out[13]);
+    }
+
+    // --- min_bbox_3d ---
+
+    #[test]
+    fn test_min_bbox_3d_basic() {
+        let mut data = vec![5.0f64; 27]; // 3×3×3
+        data[13] = 1.0; // centre
+        // bbox covering whole volume
+        let v = min_bbox_3d(&data, 3, 3, 3, &[1, 1, 1, 3, 3, 3]);
+        assert!((v - 1.0).abs() < 1e-9, "min = {v}");
+    }
+
+    #[test]
+    fn test_min_bbox_3d_empty_bbox() {
+        let data = vec![5.0f64; 8];
+        let v = min_bbox_3d(&data, 2, 2, 2, &[]);
+        assert_eq!(v, 0.0);
+    }
+
+    // --- process_flatfield_correction_frame ---
+
+    #[test]
+    fn test_flatfield_correction_shape() {
+        let frame = vec![100.0f64; 100]; // 10×10
+        let ls = vec![1.0f64; 100];
+        let bg = vec![10.0f64; 100];
+        let out = process_flatfield_correction_frame(&frame, 10, 10, &ls, 10, 10, &bg, 10, 10, None, 0.4);
+        assert_eq!(out.len(), 100);
+    }
+
+    #[test]
+    fn test_flatfield_correction_uniform() {
+        // frame=100, ls=1.0, bg=0 → corrected = 100/1.0 + 0 = 100
+        let frame = vec![100.0f64; 100];
+        let ls = vec![1.0f64; 100];
+        let bg = vec![0.0f64; 100];
+        let out = process_flatfield_correction_frame(&frame, 10, 10, &ls, 10, 10, &bg, 10, 10, Some(0.0), 0.4);
+        for v in &out {
+            assert!((v - 100.0).abs() < 1e-6, "corrected = {v}");
+        }
+    }
+
+    // --- normalize_z_stack ---
+
+    #[test]
+    fn test_normalize_z_stack_shape() {
+        let data = vec![200.0f64; 400]; // 4×10×10 in YXZ layout (10×10×4)
+        let out = normalize_z_stack(&data, 10, 10, 4);
+        assert_eq!(out.len(), 400);
+    }
+
+    // --- distance_weight_single_axis ---
+
+    #[test]
+    fn test_distance_weight_full_range() {
+        // Full range → all ones
+        let w = distance_weight_single_axis(100, 1, 100, 10, 0.99);
+        assert!((w[50] - 1.0).abs() < 1e-5, "w[50] = {}", w[50]);
+    }
+
+    #[test]
+    fn test_distance_weight_shape() {
+        let w = distance_weight_single_axis(50, 5, 45, 5, 0.99);
+        assert_eq!(w.len(), 50);
+    }
+
+    #[test]
+    fn test_distance_weight_interior_ones() {
+        // Interior (away from both ends) should be 1.0
+        let w = distance_weight_single_axis(100, 10, 90, 5, 0.99);
+        for i in 15..85 {
+            assert!((w[i] - 1.0).abs() < 1e-5, "w[{i}] = {}", w[i]);
+        }
     }
 }
