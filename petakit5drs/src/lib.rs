@@ -27,10 +27,12 @@ pub mod utils;
 // between the two, or import each module directly.
 
 pub use image_processing::{
-    b3spline_1d, b3spline_2d, binary_sphere, bw_largest_obj, bwn_hood_3d,
-    compute_bspline_coefficients, conv3_fast, fast_gauss_3d, filter_gauss_1d, filter_gauss_2d,
-    filter_gauss_3d, gradient_filter_gauss_2d, gradient_filter_gauss_3d, invert_contrast,
-    local_avg_std_2d, scale_contrast, ImageProcessingError,
+    awt_1d, b3spline_1d, b3spline_2d, bilateral_filter, binary_sphere, bw_largest_obj,
+    bwn_hood_3d, compute_bspline_coefficients, conv3_fast, fast_gauss_3d, filter_gauss_1d,
+    filter_gauss_2d, filter_gauss_3d, filter_log, gradient_filter_gauss_2d,
+    gradient_filter_gauss_3d, invert_contrast, local_avg_std_2d, non_maximum_suppression,
+    non_maximum_suppression_3d, photobleach_correction, scale_contrast, surface_filter_gauss_3d,
+    threshold_rosin, ImageProcessingError,
 };
 pub use io::{
     read_tiff,
@@ -44,7 +46,11 @@ pub use microscope_data_processing::{
     check_resample_setting,
     crop_3d,
     crop_4d,
+    decon_mask_edge_erosion,
+    decon_otf2psf,
+    decon_psf2otf,
     deskew_frame_3d,
+    erode_volume_by_2d_projection,
     estimate_computing_memory,
     group_partial_volume_files,
     imresize3_average,
@@ -54,6 +60,7 @@ pub use microscope_data_processing::{
     resample_stack_3d,
     rotate_frame_3d,
     scmos_camera_flip,
+    trim_border,
     MicroscopeProcessingError,
     // microscope_data_processing::create_zarr is available as
     // `petakit5drs::microscope_data_processing::create_zarr`

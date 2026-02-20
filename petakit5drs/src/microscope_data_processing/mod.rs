@@ -1132,6 +1132,429 @@ pub fn integral_image_3d(data: &[f64], nz: usize, ny: usize, nx: usize) -> Vec<f
     out
 }
 
+// ---------------------------------------------------------------------------
+// trim_border
+// ---------------------------------------------------------------------------
+
+/// Trim the border of a 3-D volume.
+///
+/// # Arguments
+/// * `data`        — Flat ZYX input, length `nz * ny * nx`.
+/// * `nz`, `ny`, `nx` — Input dimensions.
+/// * `border`      — Border thickness `[bz, by, bx]`.
+/// * `method`      — `"pre"` (trim start), `"post"` (trim end), `"both"`.
+///
+/// # Returns
+/// `(trimmed_data, [out_nz, out_ny, out_nx])`.
+pub fn trim_border(
+    data: &[f64],
+    nz: usize,
+    ny: usize,
+    nx: usize,
+    border: &[usize],
+    method: &str,
+) -> Result<(Vec<f64>, Vec<usize>), MicroscopeProcessingError> {
+    if border.len() != 3 {
+        return Err(MicroscopeProcessingError::InvalidDimensions);
+    }
+    let (bz, by, bx) = (border[0], border[1], border[2]);
+
+    let (sz, sy, sx, ez, ey, ex) = match method {
+        "pre" => (bz, by, bx, nz, ny, nx),
+        "post" => (
+            0, 0, 0,
+            nz.saturating_sub(bz),
+            ny.saturating_sub(by),
+            nx.saturating_sub(bx),
+        ),
+        "both" | _ => (
+            bz, by, bx,
+            nz.saturating_sub(bz),
+            ny.saturating_sub(by),
+            nx.saturating_sub(bx),
+        ),
+    };
+
+    if ez <= sz || ey <= sy || ex <= sx {
+        return Ok((vec![], vec![0, 0, 0]));
+    }
+
+    let out_nz = ez - sz;
+    let out_ny = ey - sy;
+    let out_nx = ex - sx;
+    let mut out = vec![0.0f64; out_nz * out_ny * out_nx];
+
+    for z in sz..ez {
+        for y in sy..ey {
+            for x in sx..ex {
+                out[(z - sz) * out_ny * out_nx + (y - sy) * out_nx + (x - sx)] =
+                    data[z * ny * nx + y * nx + x];
+            }
+        }
+    }
+    Ok((out, vec![out_nz, out_ny, out_nx]))
+}
+
+// ---------------------------------------------------------------------------
+// Erosion via 2-D XZ projection
+// ---------------------------------------------------------------------------
+
+/// Erode a 3-D volume via box erosion of its XZ-plane max-projection.
+///
+/// A 2-D square structuring element of side `2*esize+1` is applied to
+/// the XZ projection (max over Y); the eroded mask is then broadcast back
+/// to 3-D, and the Y edges are zeroed.
+///
+/// Returns the eroded volume (same length as input).
+pub fn erode_volume_by_2d_projection(
+    data: &[f64],
+    nz: usize,
+    ny: usize,
+    nx: usize,
+    esize: usize,
+) -> Vec<f64> {
+    if esize == 0 || data.is_empty() {
+        return data.to_vec();
+    }
+
+    // Compute XZ projection: max over Y (axis 1 in Python ZYX convention)
+    // Here data is ZYX: index z*ny*nx + y*nx + x
+    let mut xz_max = vec![false; nz * nx];
+    for z in 0..nz {
+        for x in 0..nx {
+            let mut has_nonzero = false;
+            for y in 0..ny {
+                if data[z * ny * nx + y * nx + x] != 0.0 {
+                    has_nonzero = true;
+                    break;
+                }
+            }
+            xz_max[z * nx + x] = has_nonzero;
+        }
+    }
+
+    // Erode the 2-D XZ mask with a square of radius `esize`
+    let eroded_xz: Vec<bool> = {
+        let mut e = vec![false; nz * nx];
+        let e_i = esize as isize;
+        for z in 0..nz {
+            for x in 0..nx {
+                let mut all_true = true;
+                'outer: for dz in -e_i..=e_i {
+                    for dx in -e_i..=e_i {
+                        let zi = z as isize + dz;
+                        let xi = x as isize + dx;
+                        if zi < 0
+                            || zi >= nz as isize
+                            || xi < 0
+                            || xi >= nx as isize
+                            || !xz_max[zi as usize * nx + xi as usize]
+                        {
+                            all_true = false;
+                            break 'outer;
+                        }
+                    }
+                }
+                e[z * nx + x] = all_true;
+            }
+        }
+        e
+    };
+
+    // Apply mask: zero voxels where XZ mask is false, and zero Y edges
+    let mut out = data.to_vec();
+    for z in 0..nz {
+        for y in 0..ny {
+            let in_y_border = y < esize || y >= ny.saturating_sub(esize);
+            for x in 0..nx {
+                if in_y_border || !eroded_xz[z * nx + x] {
+                    out[z * ny * nx + y * nx + x] = 0.0;
+                }
+            }
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// OTF ↔ PSF conversion
+// ---------------------------------------------------------------------------
+
+/// Convert an OTF (complex) to a PSF (real) via inverse FFT.
+///
+/// The OTF is stored as interleaved real/imaginary pairs, length `2*nz*ny*nx`.
+/// Returns a real-valued PSF of length `nz*ny*nx` with the centre shifted to
+/// element (0,0,0) (i.e. circularly shifted by `floor(crop/2)` for cropping).
+///
+/// If `out_dims` is smaller than the OTF in any dimension the PSF is cropped.
+///
+/// # Arguments
+/// * `otf_re`, `otf_im` — Real and imaginary parts of the OTF, length `nz*ny*nx`.
+/// * `nz`, `ny`, `nx`   — OTF dimensions.
+/// * `out_dims`         — Desired output size `[oz, oy, ox]`. Defaults to OTF dims.
+pub fn decon_otf2psf(
+    otf_re: &[f64],
+    otf_im: &[f64],
+    nz: usize,
+    ny: usize,
+    nx: usize,
+    out_dims: Option<&[usize]>,
+) -> Vec<f64> {
+    use rustfft::num_complex::Complex;
+    use rustfft::FftPlanner;
+
+    let n = nz * ny * nx;
+    if otf_re.len() != n || otf_im.len() != n {
+        return vec![0.0; n];
+    }
+
+    let (oz, oy, ox) = match out_dims {
+        Some(d) if d.len() >= 3 => (d[0], d[1], d[2]),
+        _ => (nz, ny, nx),
+    };
+
+    let nynx = ny * nx;
+    let mut buf: Vec<Complex<f64>> = (0..n)
+        .map(|i| Complex::new(otf_re[i], otf_im[i]))
+        .collect();
+
+    // 3-D IFFT using separable 1-D IFFTs
+    let mut planner = FftPlanner::new();
+    let ifft_x = planner.plan_fft_inverse(nx);
+    let ifft_y = planner.plan_fft_inverse(ny);
+    let ifft_z = planner.plan_fft_inverse(nz);
+
+    // IFFT along X
+    for i in 0..nz * ny {
+        ifft_x.process(&mut buf[i * nx..(i + 1) * nx]);
+    }
+    // IFFT along Y
+    let mut col = vec![Complex::new(0.0, 0.0); ny];
+    for z in 0..nz {
+        for x in 0..nx {
+            for r in 0..ny { col[r] = buf[z * nynx + r * nx + x]; }
+            ifft_y.process(&mut col);
+            for r in 0..ny { buf[z * nynx + r * nx + x] = col[r]; }
+        }
+    }
+    // IFFT along Z
+    let mut zcol = vec![Complex::new(0.0, 0.0); nz];
+    for y in 0..ny {
+        for x in 0..nx {
+            for z in 0..nz { zcol[z] = buf[z * nynx + y * nx + x]; }
+            ifft_z.process(&mut zcol);
+            for z in 0..nz { buf[z * nynx + y * nx + x] = zcol[z]; }
+        }
+    }
+    let scale = n as f64;
+    let psf: Vec<f64> = buf.iter().map(|c| c.re / scale).collect();
+
+    // Circular shift: shift by -floor(crop/2) where crop = OTF - out
+    let shift_z = nz.saturating_sub(oz) / 2;
+    let shift_y = ny.saturating_sub(oy) / 2;
+    let shift_x = nx.saturating_sub(ox) / 2;
+
+    let mut out = vec![0.0f64; oz * oy * ox];
+    let oynx = oy * ox;
+    for z in 0..oz {
+        for y in 0..oy {
+            for x in 0..ox {
+                let sz = (z + shift_z) % nz;
+                let sy = (y + shift_y) % ny;
+                let sx = (x + shift_x) % nx;
+                out[z * oynx + y * ox + x] = psf[sz * nynx + sy * nx + sx];
+            }
+        }
+    }
+    out
+}
+
+/// Convert a PSF (real) to an OTF (complex) via FFT.
+///
+/// Returns interleaved real part (first half) and imaginary part (second half)
+/// — i.e. `[re_0, re_1, …, re_{n-1}, im_0, …, im_{n-1}]`.
+///
+/// The PSF centre is assumed at `floor(psf_size/2)`. It is circularly shifted
+/// to position `(0,0,0)` before the FFT.  The PSF is zero-padded to
+/// `out_dims` if provided and larger than the PSF.
+///
+/// # Arguments
+/// * `psf`              — Real PSF, length `pz*py*px`.
+/// * `pz`, `py`, `px`   — PSF dimensions.
+/// * `out_dims`         — Output (padded) size `[oz, oy, ox]`. Defaults to PSF dims.
+pub fn decon_psf2otf(
+    psf: &[f64],
+    pz: usize,
+    py: usize,
+    px: usize,
+    out_dims: Option<&[usize]>,
+) -> Vec<f64> {
+    use rustfft::num_complex::Complex;
+    use rustfft::FftPlanner;
+
+    let (oz, oy, ox) = match out_dims {
+        Some(d) if d.len() >= 3 => (d[0], d[1], d[2]),
+        _ => (pz, py, px),
+    };
+    let on = oz * oy * ox;
+
+    if psf.is_empty() || on == 0 {
+        return vec![0.0; 2 * on];
+    }
+
+    // Build zero-padded complex buffer
+    let oynx = oy * ox;
+    let pynx = py * px;
+    let mut buf = vec![Complex::new(0.0, 0.0); on];
+    for z in 0..pz.min(oz) {
+        for y in 0..py.min(oy) {
+            for x in 0..px.min(ox) {
+                buf[z * oynx + y * ox + x] = Complex::new(psf[z * pynx + y * px + x], 0.0);
+            }
+        }
+    }
+
+    // Circularly shift PSF centre to (0,0,0)
+    // Centre is at floor(psf_size / 2) in each dimension
+    // We need to roll by -floor(pz/2), etc.
+    let sh_z = pz / 2;
+    let sh_y = py / 2;
+    let sh_x = px / 2;
+    let mut shifted = vec![Complex::new(0.0, 0.0); on];
+    for z in 0..oz {
+        for y in 0..oy {
+            for x in 0..ox {
+                let nz2 = (z + oz - sh_z) % oz;
+                let ny2 = (y + oy - sh_y) % oy;
+                let nx2 = (x + ox - sh_x) % ox;
+                shifted[nz2 * oynx + ny2 * ox + nx2] = buf[z * oynx + y * ox + x];
+            }
+        }
+    }
+
+    let mut planner = FftPlanner::new();
+    let fft_x = planner.plan_fft_forward(ox);
+    let fft_y = planner.plan_fft_forward(oy);
+    let fft_z = planner.plan_fft_forward(oz);
+
+    // FFT along X
+    for i in 0..oz * oy {
+        fft_x.process(&mut shifted[i * ox..(i + 1) * ox]);
+    }
+    // FFT along Y
+    let mut col = vec![Complex::new(0.0, 0.0); oy];
+    for z in 0..oz {
+        for x in 0..ox {
+            for r in 0..oy { col[r] = shifted[z * oynx + r * ox + x]; }
+            fft_y.process(&mut col);
+            for r in 0..oy { shifted[z * oynx + r * ox + x] = col[r]; }
+        }
+    }
+    // FFT along Z
+    let mut zcol = vec![Complex::new(0.0, 0.0); oz];
+    for y in 0..oy {
+        for x in 0..ox {
+            for z in 0..oz { zcol[z] = shifted[z * oynx + y * ox + x]; }
+            fft_z.process(&mut zcol);
+            for z in 0..oz { shifted[z * oynx + y * ox + x] = zcol[z]; }
+        }
+    }
+
+    // Pack: first on values = real, next on = imaginary
+    let mut out = vec![0.0f64; 2 * on];
+    for i in 0..on {
+        out[i] = shifted[i].re;
+        out[on + i] = shifted[i].im;
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Deconvolution mask edge erosion
+// ---------------------------------------------------------------------------
+
+/// Erode the edges of a 3-D binary mask for deconvolution.
+///
+/// For a fully-filled mask (all `true`) the border is set directly.
+/// Otherwise a box erosion of radius `edge_erosion` is applied.
+///
+/// # Arguments
+/// * `mask`         — Flat ZYX boolean mask, length `nz * ny * nx`.
+/// * `nz`, `ny`, `nx`— Dimensions.
+/// * `edge_erosion` — Border width in voxels.
+///
+/// # Returns
+/// Eroded mask of the same length.
+pub fn decon_mask_edge_erosion(
+    mask: &[bool],
+    nz: usize,
+    ny: usize,
+    nx: usize,
+    edge_erosion: usize,
+) -> Vec<bool> {
+    if edge_erosion == 0 {
+        return mask.to_vec();
+    }
+    let n = nz * ny * nx;
+    if mask.len() != n {
+        return mask.to_vec();
+    }
+
+    let all_true = mask.iter().all(|&v| v);
+    let nynx = ny * nx;
+    let mut out = mask.to_vec();
+
+    if all_true {
+        // Fast path: directly zero the border
+        let e = edge_erosion;
+        for z in 0..nz {
+            for y in 0..ny {
+                for x in 0..nx {
+                    if z < e || z >= nz.saturating_sub(e)
+                        || y < e || y >= ny.saturating_sub(e)
+                        || x < e || x >= nx.saturating_sub(e)
+                    {
+                        out[z * nynx + y * nx + x] = false;
+                    }
+                }
+            }
+        }
+    } else {
+        // General: box erosion with radius `edge_erosion`
+        let e = edge_erosion as isize;
+        for z in 0..nz {
+            for y in 0..ny {
+                for x in 0..nx {
+                    if !mask[z * nynx + y * nx + x] {
+                        out[z * nynx + y * nx + x] = false;
+                        continue;
+                    }
+                    let mut keep = true;
+                    'outer: for dz in -e..=e {
+                        for dy in -e..=e {
+                            for dx in -e..=e {
+                                let zi = z as isize + dz;
+                                let yi = y as isize + dy;
+                                let xi = x as isize + dx;
+                                if zi < 0 || zi >= nz as isize
+                                    || yi < 0 || yi >= ny as isize
+                                    || xi < 0 || xi >= nx as isize
+                                    || !mask[zi as usize * nynx + yi as usize * nx + xi as usize]
+                                {
+                                    keep = false;
+                                    break 'outer;
+                                }
+                            }
+                        }
+                    }
+                    out[z * nynx + y * nx + x] = keep;
+                }
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1458,5 +1881,132 @@ mod tests {
         let data = vec![5.0f64];
         let out = integral_image_3d(&data, 1, 1, 1);
         assert_eq!(out, vec![5.0]);
+    }
+
+    // --- trim_border ---
+
+    #[test]
+    fn test_trim_border_both() {
+        let data: Vec<f64> = (0..27).map(|i| i as f64).collect(); // 3×3×3
+        let (out, dims) = trim_border(&data, 3, 3, 3, &[1, 1, 1], "both").unwrap();
+        assert_eq!(dims, vec![1, 1, 1]);
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn test_trim_border_pre() {
+        let data = vec![0.0f64; 125]; // 5×5×5
+        let (out, dims) = trim_border(&data, 5, 5, 5, &[1, 1, 1], "pre").unwrap();
+        assert_eq!(dims, vec![4, 4, 4]);
+        assert_eq!(out.len(), 64);
+    }
+
+    #[test]
+    fn test_trim_border_post() {
+        let data = vec![0.0f64; 125];
+        let (out, dims) = trim_border(&data, 5, 5, 5, &[1, 1, 1], "post").unwrap();
+        assert_eq!(dims, vec![4, 4, 4]);
+        assert_eq!(out.len(), 64);
+    }
+
+    #[test]
+    fn test_trim_border_zero_border() {
+        let data: Vec<f64> = (0..8).map(|i| i as f64).collect(); // 2×2×2
+        let (out, dims) = trim_border(&data, 2, 2, 2, &[0, 0, 0], "both").unwrap();
+        assert_eq!(dims, vec![2, 2, 2]);
+        assert_eq!(out, data);
+    }
+
+    // --- erode_volume_by_2d_projection ---
+
+    #[test]
+    fn test_erode_volume_by_2d_projection_zero_esize() {
+        let data: Vec<f64> = (0..27).map(|i| i as f64).collect();
+        let out = erode_volume_by_2d_projection(&data, 3, 3, 3, 0);
+        assert_eq!(out, data);
+    }
+
+    #[test]
+    fn test_erode_volume_by_2d_projection_zeros_border() {
+        // 5×5×5 volume full of ones, esize=1 → border voxels should be zeroed
+        let data = vec![1.0f64; 125];
+        let out = erode_volume_by_2d_projection(&data, 5, 5, 5, 1);
+        // Y border (y=0 and y=4) should be zero
+        for x in 0..5 {
+            for z in 0..5 {
+                assert_eq!(out[z * 25 + 0 * 5 + x], 0.0);
+                assert_eq!(out[z * 25 + 4 * 5 + x], 0.0);
+            }
+        }
+    }
+
+    // --- decon_otf2psf / decon_psf2otf round-trip ---
+
+    #[test]
+    fn test_decon_psf2otf_shape() {
+        // PSF of size 4×4×4, output same size → OTF has same number of elements
+        let psf: Vec<f64> = (0..64).map(|i| i as f64).collect();
+        let otf = decon_psf2otf(&psf, 4, 4, 4, None);
+        // Returns 2 * n elements (real + imag)
+        assert_eq!(otf.len(), 2 * 64);
+    }
+
+    #[test]
+    fn test_decon_otf2psf_shape() {
+        // Build trivial OTF (all real, no imag)
+        let otf_re = vec![1.0f64; 64];
+        let otf_im = vec![0.0f64; 64];
+        let psf = decon_otf2psf(&otf_re, &otf_im, 4, 4, 4, None);
+        assert_eq!(psf.len(), 64);
+    }
+
+    #[test]
+    fn test_decon_psf2otf_roundtrip() {
+        // A delta PSF (impulse) should have a flat OTF; then IFFT → delta
+        let mut psf = vec![0.0f64; 8 * 8 * 8];
+        psf[4 * 64 + 4 * 8 + 4] = 1.0; // centre of 8×8×8
+        let otf = decon_psf2otf(&psf, 8, 8, 8, None);
+        let re = &otf[..512];
+        let im = &otf[512..];
+        // For a shifted delta, all OTF magnitudes should be close to 1
+        for i in 0..512 {
+            let mag = (re[i] * re[i] + im[i] * im[i]).sqrt();
+            assert!((mag - 1.0).abs() < 1e-6, "OTF mag[{i}] = {mag}");
+        }
+        // Round-trip: OTF → PSF should recover the original
+        let recovered = decon_otf2psf(re, im, 8, 8, 8, None);
+        // Maximum should be near 1.0
+        let max_val = recovered.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        assert!((max_val - 1.0).abs() < 1e-6, "recovered max = {max_val}");
+    }
+
+    // --- decon_mask_edge_erosion ---
+
+    #[test]
+    fn test_decon_mask_edge_erosion_zero() {
+        let mask = vec![true; 27];
+        let out = decon_mask_edge_erosion(&mask, 3, 3, 3, 0);
+        assert!(out.iter().all(|&v| v));
+    }
+
+    #[test]
+    fn test_decon_mask_edge_erosion_full_mask() {
+        let mask = vec![true; 125]; // 5×5×5
+        let out = decon_mask_edge_erosion(&mask, 5, 5, 5, 1);
+        // Interior (3×3×3 = 27 voxels) should remain true
+        let true_count = out.iter().filter(|&&v| v).count();
+        assert_eq!(true_count, 27, "interior voxels: {true_count}");
+    }
+
+    #[test]
+    fn test_decon_mask_edge_erosion_partial_mask() {
+        let mut mask = vec![false; 27]; // 3×3×3
+        // Set only centre voxel
+        mask[13] = true;
+        // With esize=1, centre should survive (all neighbours in the box exist, but box is fully masked)
+        // Actually centre only has itself as true; erosion with any esize>0 will zero it
+        let out = decon_mask_edge_erosion(&mask, 3, 3, 3, 1);
+        // Centre should be removed because some neighbours are false
+        assert!(!out[13]);
     }
 }

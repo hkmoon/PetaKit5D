@@ -1143,6 +1143,733 @@ pub fn fast_gauss_3d(
     conv1d_border(&tmp, &k_z, 0, correct_border) // Z
 }
 
+// ---------------------------------------------------------------------------
+// Bilateral filter
+// ---------------------------------------------------------------------------
+
+/// Edge-preserving bilateral filter for 2-D images.
+///
+/// Applies a spatial Gaussian (controlled by `sigma_s`) combined with a
+/// range/intensity Gaussian (controlled by `sigma_r`).
+///
+/// This uses a direct sliding-window approach: for each output pixel the
+/// nearby pixels within a `ceil(3*sigma_s)` radius are weighted by
+/// `exp(-|pos|²/(2σ_s²)) * exp(-|intensity_diff|²/(2σ_r²))`.
+///
+/// # Arguments
+/// * `data`        — Flat 2-D input (row-major), length `rows * cols`.
+/// * `rows`, `cols`— Dimensions.
+/// * `sigma_s`     — Spatial standard deviation.
+/// * `sigma_r`     — Range (intensity) standard deviation.
+pub fn bilateral_filter(
+    data: &[f64],
+    rows: usize,
+    cols: usize,
+    sigma_s: f64,
+    sigma_r: f64,
+) -> Vec<f64> {
+    if data.is_empty() || sigma_s <= 0.0 || sigma_r <= 0.0 {
+        return data.to_vec();
+    }
+    let w = (3.0 * sigma_s).ceil() as usize;
+    let ss2 = 2.0 * sigma_s * sigma_s;
+    let sr2 = 2.0 * sigma_r * sigma_r;
+
+    let mut out = vec![0.0f64; rows * cols];
+    for r in 0..rows {
+        for c in 0..cols {
+            let center = data[r * cols + c];
+            let mut sum_w = 0.0f64;
+            let mut sum_v = 0.0f64;
+            let r_lo = if r >= w { r - w } else { 0 };
+            let r_hi = (r + w).min(rows - 1);
+            let c_lo = if c >= w { c - w } else { 0 };
+            let c_hi = (c + w).min(cols - 1);
+            for rr in r_lo..=r_hi {
+                let dr = (rr as f64 - r as f64).powi(2);
+                for cc in c_lo..=c_hi {
+                    let dc = (cc as f64 - c as f64).powi(2);
+                    let v = data[rr * cols + cc];
+                    let di = (v - center).powi(2);
+                    let w = (-(dr + dc) / ss2 - di / sr2).exp();
+                    sum_w += w;
+                    sum_v += w * v;
+                }
+            }
+            out[r * cols + c] = if sum_w > 0.0 { sum_v / sum_w } else { center };
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// LoG filter via FFT
+// ---------------------------------------------------------------------------
+
+/// Laplacian-of-Gaussian (LoG) filter applied in the frequency domain.
+///
+/// The LoG kernel in Fourier space is `|ω|² · exp(-σ²|ω|²/2)`.
+/// Works for 1-D (`dims=[n]`), 2-D (`dims=[ny, nx]`), or 3-D
+/// (`dims=[nz, ny, nx]`).
+///
+/// # Arguments
+/// * `data` — Flat input (row-major for 2D/3D).
+/// * `dims` — Dimension sizes (length 1, 2, or 3).
+/// * `sigma`— Gaussian standard deviation.
+///
+/// # Returns
+/// Filtered data, same length as input.
+pub fn filter_log(
+    data: &[f64],
+    dims: &[usize],
+    sigma: f64,
+) -> Vec<f64> {
+    use rustfft::num_complex::Complex;
+    use rustfft::FftPlanner;
+
+    if data.is_empty() || sigma <= 0.0 {
+        return data.to_vec();
+    }
+
+    // Build frequency-domain LoG weights: |ω|² · exp(-σ²|ω|²/2)
+    // ω_k = 2π·k/n  for k=0..n-1 (FFT convention)
+    let freq_1d = |n: usize| -> Vec<f64> {
+        let mut f = vec![0.0f64; n];
+        for k in 0..n {
+            let fk = if k <= n / 2 { k as f64 } else { k as f64 - n as f64 };
+            f[k] = 2.0 * std::f64::consts::PI * fk / n as f64;
+        }
+        f
+    };
+
+    match dims.len() {
+        1 => {
+            let n = dims[0];
+            let w = freq_1d(n);
+            let log_w: Vec<f64> = w.iter().map(|&wi| {
+                let w2 = wi * wi;
+                w2 * (-0.5 * sigma * sigma * w2).exp()
+            }).collect();
+
+            let mut planner = FftPlanner::new();
+            let fft = planner.plan_fft_forward(n);
+            let ifft = planner.plan_fft_inverse(n);
+            let mut buf: Vec<Complex<f64>> = data.iter().map(|&v| Complex::new(v, 0.0)).collect();
+            fft.process(&mut buf);
+            for (b, lw) in buf.iter_mut().zip(log_w.iter()) {
+                *b *= lw;
+            }
+            ifft.process(&mut buf);
+            buf.iter().map(|c| c.re / n as f64).collect()
+        }
+        2 => {
+            let (ny, nx) = (dims[0], dims[1]);
+            let wy = freq_1d(ny);
+            let wx = freq_1d(nx);
+            let s2 = sigma * sigma;
+
+            let mut planner = FftPlanner::new();
+            // 2D FFT: row-by-row along X, then column-by-column along Y
+            let fft_x = planner.plan_fft_forward(nx);
+            let ifft_x = planner.plan_fft_inverse(nx);
+            let fft_y = planner.plan_fft_forward(ny);
+            let ifft_y = planner.plan_fft_inverse(ny);
+
+            let mut buf: Vec<Complex<f64>> = data.iter().map(|&v| Complex::new(v, 0.0)).collect();
+            // FFT along X
+            for r in 0..ny {
+                fft_x.process(&mut buf[r * nx..(r + 1) * nx]);
+            }
+            // FFT along Y (need transpose trick)
+            let mut col_buf = vec![Complex::new(0.0, 0.0); ny];
+            for c in 0..nx {
+                for r in 0..ny { col_buf[r] = buf[r * nx + c]; }
+                fft_y.process(&mut col_buf);
+                for r in 0..ny { buf[r * nx + c] = col_buf[r]; }
+            }
+            // Apply LoG weights
+            for r in 0..ny {
+                for c in 0..nx {
+                    let w2 = wy[r] * wy[r] + wx[c] * wx[c];
+                    buf[r * nx + c] *= w2 * (-0.5 * s2 * w2).exp();
+                }
+            }
+            // IFFT along Y
+            for c in 0..nx {
+                for r in 0..ny { col_buf[r] = buf[r * nx + c]; }
+                ifft_y.process(&mut col_buf);
+                for r in 0..ny { buf[r * nx + c] = col_buf[r]; }
+            }
+            // IFFT along X
+            for r in 0..ny {
+                ifft_x.process(&mut buf[r * nx..(r + 1) * nx]);
+            }
+            let scale = (nx * ny) as f64;
+            buf.iter().map(|c| c.re / scale).collect()
+        }
+        3 => {
+            let (nz, ny, nx) = (dims[0], dims[1], dims[2]);
+            let wz = freq_1d(nz);
+            let wy = freq_1d(ny);
+            let wx = freq_1d(nx);
+            let s2 = sigma * sigma;
+            let nynx = ny * nx;
+
+            let mut planner = FftPlanner::new();
+            let fft_x = planner.plan_fft_forward(nx);
+            let ifft_x = planner.plan_fft_inverse(nx);
+            let fft_y = planner.plan_fft_forward(ny);
+            let ifft_y = planner.plan_fft_inverse(ny);
+            let fft_z = planner.plan_fft_forward(nz);
+            let ifft_z = planner.plan_fft_inverse(nz);
+
+            let mut buf: Vec<Complex<f64>> = data.iter().map(|&v| Complex::new(v, 0.0)).collect();
+            // FFT along X
+            for i in 0..nz * ny {
+                fft_x.process(&mut buf[i * nx..(i + 1) * nx]);
+            }
+            // FFT along Y
+            let mut col_buf = vec![Complex::new(0.0, 0.0); ny];
+            for z in 0..nz {
+                for c in 0..nx {
+                    for r in 0..ny { col_buf[r] = buf[z * nynx + r * nx + c]; }
+                    fft_y.process(&mut col_buf);
+                    for r in 0..ny { buf[z * nynx + r * nx + c] = col_buf[r]; }
+                }
+            }
+            // FFT along Z
+            let mut z_buf = vec![Complex::new(0.0, 0.0); nz];
+            for y in 0..ny {
+                for x in 0..nx {
+                    for z in 0..nz { z_buf[z] = buf[z * nynx + y * nx + x]; }
+                    fft_z.process(&mut z_buf);
+                    for z in 0..nz { buf[z * nynx + y * nx + x] = z_buf[z]; }
+                }
+            }
+            // Apply LoG weights
+            for z in 0..nz {
+                for y in 0..ny {
+                    for x in 0..nx {
+                        let w2 = wz[z] * wz[z] + wy[y] * wy[y] + wx[x] * wx[x];
+                        buf[z * nynx + y * nx + x] *= w2 * (-0.5 * s2 * w2).exp();
+                    }
+                }
+            }
+            // IFFT along Z
+            for y in 0..ny {
+                for x in 0..nx {
+                    for z in 0..nz { z_buf[z] = buf[z * nynx + y * nx + x]; }
+                    ifft_z.process(&mut z_buf);
+                    for z in 0..nz { buf[z * nynx + y * nx + x] = z_buf[z]; }
+                }
+            }
+            // IFFT along Y
+            for z in 0..nz {
+                for c in 0..nx {
+                    for r in 0..ny { col_buf[r] = buf[z * nynx + r * nx + c]; }
+                    ifft_y.process(&mut col_buf);
+                    for r in 0..ny { buf[z * nynx + r * nx + c] = col_buf[r]; }
+                }
+            }
+            // IFFT along X
+            for i in 0..nz * ny {
+                ifft_x.process(&mut buf[i * nx..(i + 1) * nx]);
+            }
+            let scale = (nz * ny * nx) as f64;
+            buf.iter().map(|c| c.re / scale).collect()
+        }
+        _ => data.to_vec(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Non-maximum suppression (2D)
+// ---------------------------------------------------------------------------
+
+/// Non-maximum suppression along the orientation direction for a 2-D response.
+///
+/// Each pixel is kept only if its response is ≥ both bilinearly-interpolated
+/// neighbours at ±1 pixel along the local `orientation` (radians).
+///
+/// # Arguments
+/// * `response`    — Flat 2-D response map, length `rows * cols`.
+/// * `orientation` — Flat 2-D orientation map (radians), same size.
+/// * `rows`, `cols`— Dimensions.
+pub fn non_maximum_suppression(
+    response: &[f64],
+    orientation: &[f64],
+    rows: usize,
+    cols: usize,
+) -> Vec<f64> {
+    if response.is_empty() || response.len() != rows * cols {
+        return response.to_vec();
+    }
+
+    // Build symmetrically-padded response (1 pixel each side)
+    let pr = rows + 2;
+    let pc = cols + 2;
+    let mut padded = vec![0.0f64; pr * pc];
+    for r in 0..rows {
+        for c in 0..cols {
+            // symmetric: clamp to [0, rows-1] / [0, cols-1]
+            padded[(r + 1) * pc + (c + 1)] = response[r * cols + c];
+        }
+        // left/right borders
+        padded[(r + 1) * pc] = response[r * cols];
+        padded[(r + 1) * pc + cols + 1] = response[r * cols + cols - 1];
+    }
+    for c in 0..pc {
+        padded[c] = padded[pc + c];
+        padded[(pr - 1) * pc + c] = padded[(pr - 2) * pc + c];
+    }
+
+    let bilinear = |y: f64, x: f64| -> f64 {
+        let y = y.clamp(0.0, (pr - 1) as f64);
+        let x = x.clamp(0.0, (pc - 1) as f64);
+        let y0 = y.floor() as usize;
+        let y1 = (y0 + 1).min(pr - 1);
+        let x0 = x.floor() as usize;
+        let x1 = (x0 + 1).min(pc - 1);
+        let ty = y - y.floor();
+        let tx = x - x.floor();
+        let v00 = padded[y0 * pc + x0];
+        let v01 = padded[y0 * pc + x1];
+        let v10 = padded[y1 * pc + x0];
+        let v11 = padded[y1 * pc + x1];
+        v00 * (1.0 - ty) * (1.0 - tx)
+            + v01 * (1.0 - ty) * tx
+            + v10 * ty * (1.0 - tx)
+            + v11 * ty * tx
+    };
+
+    let mut out = vec![0.0f64; rows * cols];
+    for r in 0..rows {
+        for c in 0..cols {
+            let theta = orientation[r * cols + c];
+            let cos_t = theta.cos();
+            let sin_t = theta.sin();
+            // Padded coordinates (+1 for padding offset)
+            let py = (r + 1) as f64;
+            let px = (c + 1) as f64;
+            let a1 = bilinear(py + sin_t, px + cos_t);
+            let a2 = bilinear(py - sin_t, px - cos_t);
+            let v = response[r * cols + c];
+            out[r * cols + c] = if v >= a1 && v >= a2 { v } else { 0.0 };
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// 3-D Non-maximum suppression
+// ---------------------------------------------------------------------------
+
+/// Non-maximum suppression for a 3-D vector field.
+///
+/// Retains the magnitude at each voxel only when it is ≥ both trilinearly-
+/// interpolated magnitudes ±1 step along the local vector direction.
+///
+/// # Arguments
+/// * `u`, `v`, `w`    — X, Y, Z vector components (flat ZYX, length `nz*ny*nx`).
+/// * `nz`, `ny`, `nx` — Volume dimensions.
+pub fn non_maximum_suppression_3d(
+    u: &[f64],
+    v: &[f64],
+    w: &[f64],
+    nz: usize,
+    ny: usize,
+    nx: usize,
+) -> Vec<f64> {
+    let n = nz * ny * nx;
+    if u.len() != n || v.len() != n || w.len() != n {
+        return vec![0.0; n];
+    }
+    let nynx = ny * nx;
+
+    // Compute magnitude
+    let mag: Vec<f64> = (0..n)
+        .map(|i| (u[i] * u[i] + v[i] * v[i] + w[i] * w[i]).sqrt())
+        .collect();
+
+    // Padded magnitude (1 voxel each side, symmetric)
+    let pz = nz + 2;
+    let py = ny + 2;
+    let px = nx + 2;
+    let pynx = py * px;
+    let mut padded = vec![0.0f64; pz * pynx];
+    for z in 0..nz {
+        for y in 0..ny {
+            for x in 0..nx {
+                padded[(z + 1) * pynx + (y + 1) * px + (x + 1)] = mag[z * nynx + y * nx + x];
+            }
+        }
+    }
+    // Mirror borders along each axis
+    for z in 0..pz {
+        for y in 0..py {
+            padded[z * pynx + y * px] = padded[z * pynx + y * px + 1];
+            padded[z * pynx + y * px + px - 1] = padded[z * pynx + y * px + px - 2];
+        }
+    }
+    for z in 0..pz {
+        for x in 0..px {
+            padded[z * pynx + x] = padded[z * pynx + px + x];
+            padded[z * pynx + (py - 1) * px + x] = padded[z * pynx + (py - 2) * px + x];
+        }
+    }
+    for y in 0..py {
+        for x in 0..px {
+            padded[y * px + x] = padded[pynx + y * px + x];
+            padded[(pz - 1) * pynx + y * px + x] = padded[(pz - 2) * pynx + y * px + x];
+        }
+    }
+
+    let trilinear = |fz: f64, fy: f64, fx: f64| -> f64 {
+        let fz = fz.clamp(0.0, (pz - 1) as f64);
+        let fy = fy.clamp(0.0, (py - 1) as f64);
+        let fx = fx.clamp(0.0, (px - 1) as f64);
+        let z0 = fz.floor() as usize;
+        let z1 = (z0 + 1).min(pz - 1);
+        let y0 = fy.floor() as usize;
+        let y1 = (y0 + 1).min(py - 1);
+        let x0 = fx.floor() as usize;
+        let x1 = (x0 + 1).min(px - 1);
+        let tz = fz - fz.floor();
+        let ty = fy - fy.floor();
+        let tx = fx - fx.floor();
+        macro_rules! p { ($z:expr,$y:expr,$x:expr) => { padded[$z * pynx + $y * px + $x] }; }
+        let v000 = p!(z0, y0, x0);
+        let v001 = p!(z0, y0, x1);
+        let v010 = p!(z0, y1, x0);
+        let v011 = p!(z0, y1, x1);
+        let v100 = p!(z1, y0, x0);
+        let v101 = p!(z1, y0, x1);
+        let v110 = p!(z1, y1, x0);
+        let v111 = p!(z1, y1, x1);
+        let v00 = v000 * (1.0 - tx) + v001 * tx;
+        let v01 = v010 * (1.0 - tx) + v011 * tx;
+        let v10 = v100 * (1.0 - tx) + v101 * tx;
+        let v11 = v110 * (1.0 - tx) + v111 * tx;
+        let v0 = v00 * (1.0 - ty) + v01 * ty;
+        let v1 = v10 * (1.0 - ty) + v11 * ty;
+        v0 * (1.0 - tz) + v1 * tz
+    };
+
+    let mut out = mag.clone();
+    for z in 0..nz {
+        for y in 0..ny {
+            for x in 0..nx {
+                let idx = z * nynx + y * nx + x;
+                let m = mag[idx];
+                if m == 0.0 {
+                    out[idx] = 0.0;
+                    continue;
+                }
+                let un = u[idx] / m;
+                let vn = v[idx] / m;
+                let wn = w[idx] / m;
+                // Padded coordinates
+                let pz_f = (z + 1) as f64;
+                let py_f = (y + 1) as f64;
+                let px_f = (x + 1) as f64;
+                let m1 = trilinear(pz_f + vn, py_f + un, px_f + wn);
+                let m2 = trilinear(pz_f - vn, py_f - un, px_f - wn);
+                if m <= m1 || m <= m2 {
+                    out[idx] = 0.0;
+                }
+            }
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Rosin threshold
+// ---------------------------------------------------------------------------
+
+/// Compute the Rosin threshold for a 1-D histogram.
+///
+/// Draws a line from the histogram peak to the last non-zero bin and
+/// returns the bin centre at maximum perpendicular distance from that line.
+///
+/// # Arguments
+/// * `data` — Input values (any shape, treated as a flat list).
+///
+/// # Returns
+/// Threshold value as `f64`.
+pub fn threshold_rosin(data: &[f64]) -> f64 {
+    if data.is_empty() {
+        return 0.0;
+    }
+    const N_BINS: usize = 256;
+    let dmin = data.iter().cloned().fold(f64::INFINITY, f64::min);
+    let dmax = data.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    if dmin >= dmax {
+        return dmin;
+    }
+    let mut hist = vec![0usize; N_BINS];
+    for &v in data {
+        let bin = ((v - dmin) / (dmax - dmin) * (N_BINS - 1) as f64).round() as usize;
+        hist[bin.min(N_BINS - 1)] += 1;
+    }
+    // Bin centres
+    let bin_center = |i: usize| dmin + (i as f64 + 0.5) * (dmax - dmin) / N_BINS as f64;
+
+    let peak_idx = hist.iter().enumerate().max_by_key(|&(_, v)| v).map(|(i, _)| i).unwrap_or(0);
+    let tail_idx = hist.iter().enumerate().rev().find(|&(_, &v)| v > 0).map(|(i, _)| i).unwrap_or(peak_idx);
+    if peak_idx == tail_idx {
+        return bin_center(peak_idx);
+    }
+    let (x1, y1) = (peak_idx as f64, hist[peak_idx] as f64);
+    let (x2, y2) = (tail_idx as f64, hist[tail_idx] as f64);
+    let denom = ((y2 - y1).powi(2) + (x2 - x1).powi(2)).sqrt() + 1e-10;
+
+    let mut best_i = peak_idx;
+    let mut best_dist = 0.0f64;
+    for i in peak_idx..=tail_idx {
+        let (x0, y0) = (i as f64, hist[i] as f64);
+        let dist = ((y2 - y1) * x0 - (x2 - x1) * y0 + x2 * y1 - y2 * x1).abs() / denom;
+        if dist > best_dist {
+            best_dist = dist;
+            best_i = i;
+        }
+    }
+    bin_center(best_i)
+}
+
+// ---------------------------------------------------------------------------
+// Surface filter (Gaussian second derivatives)
+// ---------------------------------------------------------------------------
+
+/// Filter a 3-D volume with Gaussian second-derivative kernels.
+///
+/// Returns three volumes `(d2X, d2Y, d2Z)` representing the second partial
+/// derivative responses (positive at bright surfaces).
+///
+/// # Arguments
+/// * `data`             — Flat ZYX input, length `nz * ny * nx`.
+/// * `nz`, `ny`, `nx`   — Volume dimensions.
+/// * `sigma`            — Isotropic Gaussian standard deviation.
+pub fn surface_filter_gauss_3d(
+    data: &[f64],
+    nz: usize,
+    ny: usize,
+    nx: usize,
+    sigma: f64,
+) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    if data.is_empty() || sigma <= 0.0 {
+        let d = data.to_vec();
+        return (d.clone(), d.clone(), d);
+    }
+    let w = (5.0 * sigma).ceil() as usize;
+    let size = 2 * w + 1;
+    let s2 = sigma * sigma;
+    let nynx = ny * nx;
+
+    let mut g = vec![0.0f64; size];
+    let mut d2g = vec![0.0f64; size];
+    for i in 0..size {
+        let x = i as f64 - w as f64;
+        let gv = (-0.5 * x * x / s2).exp();
+        g[i] = gv;
+        // Second derivative of Gaussian: -(x²/σ²-1)/σ² · G(x)
+        d2g[i] = -(x * x / s2 - 1.0) / s2 * gv;
+    }
+    let gsum: f64 = g.iter().sum();
+    g.iter_mut().for_each(|v| *v /= gsum);
+    d2g.iter_mut().for_each(|v| *v /= gsum);
+
+    // conv along axis: 0=Z, 1=Y, 2=X
+    let conv3d = |src: &[f64], kernel: &[f64], axis: usize| -> Vec<f64> {
+        let klen = kernel.len();
+        let khalf = klen / 2;
+        let mut out = vec![0.0f64; nz * nynx];
+        for z in 0..nz {
+            for y in 0..ny {
+                for x in 0..nx {
+                    let mut s = 0.0;
+                    for k in 0..klen {
+                        let offset = k as isize - khalf as isize;
+                        let (zi, yi, xi) = match axis {
+                            0 => (z as isize + offset, y as isize, x as isize),
+                            1 => (z as isize, y as isize + offset, x as isize),
+                            _ => (z as isize, y as isize, x as isize + offset),
+                        };
+                        if zi >= 0 && zi < nz as isize
+                            && yi >= 0 && yi < ny as isize
+                            && xi >= 0 && xi < nx as isize
+                        {
+                            s += src[zi as usize * nynx + yi as usize * nx + xi as usize]
+                                * kernel[k];
+                        }
+                    }
+                    out[z * nynx + y * nx + x] = s;
+                }
+            }
+        }
+        out
+    };
+
+    // d2X: 2nd deriv in X (axis 2), smooth Y and Z
+    let tmp = conv3d(data, &d2g, 2);
+    let tmp = conv3d(&tmp, &g, 1);
+    let d2x = conv3d(&tmp, &g, 0);
+
+    // d2Y: 2nd deriv in Y (axis 1), smooth X and Z
+    let tmp = conv3d(data, &g, 2);
+    let tmp = conv3d(&tmp, &d2g, 1);
+    let d2y = conv3d(&tmp, &g, 0);
+
+    // d2Z: 2nd deriv in Z (axis 0), smooth X and Y
+    let tmp = conv3d(data, &g, 2);
+    let tmp = conv3d(&tmp, &g, 1);
+    let d2z = conv3d(&tmp, &d2g, 0);
+
+    (d2x, d2y, d2z)
+}
+
+// ---------------------------------------------------------------------------
+// A Trou 1-D Wavelet Transform
+// ---------------------------------------------------------------------------
+
+/// Compute the 1-D A Trou Wavelet Transform.
+///
+/// Returns a `(n, n_bands+1)` row-major matrix where columns `0..n_bands`
+/// are the detail coefficients and column `n_bands` is the final
+/// approximation.  Uses kernel `[1,4,6,4,1]/16` with dilation `2^(k-1)` at
+/// scale `k`.
+///
+/// # Arguments
+/// * `signal`  — Input 1-D signal, length `n`.
+/// * `n_bands` — Number of wavelet bands; if 0, defaults to `ceil(log2(n))`.
+///
+/// # Returns
+/// Flat row-major output of length `n * (n_bands + 1)`.
+/// Row `i`, column `k` → index `i * (n_bands + 1) + k`.
+pub fn awt_1d(signal: &[f64], n_bands: usize) -> Vec<f64> {
+    let n = signal.len();
+    if n == 0 {
+        return vec![];
+    }
+    let k_max = ((n as f64).log2().ceil() as usize).max(1);
+    let nb = if n_bands == 0 { k_max } else { n_bands.min(k_max) };
+    let cols = nb + 1;
+    let mut out = vec![0.0f64; n * cols];
+
+    let convolve_awt = |sig: &[f64], k: usize| -> Vec<f64> {
+        let k1 = 1usize << (k - 1); // 2^(k-1)
+        let k2 = 2 * k1;
+        // Symmetric pad of size k2 on each side
+        let mut tmp = vec![0.0f64; n + 2 * k2];
+        for i in 0..n {
+            tmp[i + k2] = sig[i];
+        }
+        // Reflect left boundary
+        for i in 0..k2 {
+            let src = k2 - 1 - i; // mirror index
+            tmp[i] = sig[src.min(n - 1)];
+        }
+        // Reflect right boundary
+        for i in 0..k2 {
+            let src = n - 1 - i.min(n - 1);
+            tmp[n + k2 + i] = sig[src];
+        }
+        let mut result = vec![0.0f64; n];
+        for i in 0..n {
+            let ci = i + k2; // index in padded array
+            result[i] = (6.0 * tmp[ci]
+                + 4.0 * (tmp[ci + k1] + tmp[ci - k1])
+                + tmp[ci + k2]
+                + tmp[ci - k2])
+                / 16.0;
+        }
+        result
+    };
+
+    let mut last_a = signal.to_vec();
+    for band in 0..nb {
+        let new_a = convolve_awt(&last_a, band + 1);
+        for i in 0..n {
+            out[i * cols + band] = last_a[i] - new_a[i]; // detail
+        }
+        last_a = new_a;
+    }
+    // Final approximation in last column
+    for i in 0..n {
+        out[i * cols + nb] = last_a[i];
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Photobleach correction
+// ---------------------------------------------------------------------------
+
+/// Correct photobleaching in a fluorescence time series using exponential fitting.
+///
+/// For each time frame, a mean intensity is computed over the non-zero region.
+/// A simple single exponential `a·exp(b·t)` is fit to the mean intensities, and
+/// each frame is divided by the fitted value.  Falls back to linear correction
+/// when the exponential fit fails.
+///
+/// # Arguments
+/// * `data`   — Flat array of length `n_pixels * n_frames`.
+/// * `n`      — Number of pixels per frame (`n_pixels`).
+/// * `frames` — Number of time frames.
+///
+/// # Returns
+/// Corrected data of the same length.
+pub fn photobleach_correction(data: &[f64], n: usize, frames: usize) -> Vec<f64> {
+    if data.len() != n * frames || frames == 0 || n == 0 {
+        return data.to_vec();
+    }
+    // Compute mean intensity per frame (over all non-zero pixels)
+    let means: Vec<f64> = (0..frames)
+        .map(|f| {
+            let slice = &data[f * n..(f + 1) * n];
+            let (s, c) = slice
+                .iter()
+                .filter(|&&v| v != 0.0)
+                .fold((0.0, 0usize), |(s, c), &v| (s + v, c + 1));
+            if c > 0 { s / c as f64 } else { 0.0 }
+        })
+        .collect();
+
+    // Fit simple single exponential: mean ≈ a·exp(b·t) using log-linear regression
+    let m0 = means.iter().cloned().fold(f64::INFINITY, f64::min).max(1e-12);
+    let log_means: Vec<f64> = means.iter().map(|&m| m.max(m0).ln()).collect();
+    let t_vals: Vec<f64> = (0..frames).map(|i| i as f64).collect();
+
+    // Linear regression: log(m) = log(a) + b*t
+    let (ta, tb): (f64, f64) = {
+        let n_f = frames as f64;
+        let sx: f64 = t_vals.iter().sum();
+        let sy: f64 = log_means.iter().sum();
+        let sxy: f64 = t_vals.iter().zip(log_means.iter()).map(|(x, y)| x * y).sum();
+        let sx2: f64 = t_vals.iter().map(|x| x * x).sum();
+        let denom = n_f * sx2 - sx * sx;
+        if denom.abs() < 1e-10 {
+            (sy / n_f, 0.0)
+        } else {
+            let b = (n_f * sxy - sx * sy) / denom;
+            let a = (sy - b * sx) / n_f;
+            (a, b)
+        }
+    };
+
+    // Correction: divide each frame by fitted value (clamped to minimum)
+    let mut out = data.to_vec();
+    for f in 0..frames {
+        let fit = (ta + tb * f as f64).exp().max(1e-12);
+        let frame_correction = means[0].max(1e-12) / fit;
+        let slice = &mut out[f * n..(f + 1) * n];
+        for v in slice.iter_mut() {
+            *v *= frame_correction;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1390,6 +2117,171 @@ mod tests {
         let out = fast_gauss_3d(&data, 4, 4, 4, 1.0, 1.0, true);
         for v in &out {
             assert!((v - 3.0).abs() < 1e-9, "uniform: {v}");
+        }
+    }
+
+    // --- bilateral_filter ---
+
+    #[test]
+    fn test_bilateral_filter_shape() {
+        let data = vec![1.0f64; 100]; // 10×10
+        let out = bilateral_filter(&data, 10, 10, 2.0, 0.5);
+        assert_eq!(out.len(), 100);
+    }
+
+    #[test]
+    fn test_bilateral_filter_uniform() {
+        // Filtering uniform image should return same values
+        let data = vec![3.0f64; 100];
+        let out = bilateral_filter(&data, 10, 10, 2.0, 0.5);
+        for v in &out {
+            assert!((v - 3.0).abs() < 1e-9, "bilateral uniform: {v}");
+        }
+    }
+
+    // --- filter_log ---
+
+    #[test]
+    fn test_filter_log_1d_shape() {
+        let data = vec![1.0f64; 64];
+        let out = filter_log(&data, &[64], 2.0);
+        assert_eq!(out.len(), 64);
+    }
+
+    #[test]
+    fn test_filter_log_2d_shape() {
+        let data = vec![1.0f64; 400]; // 20×20
+        let out = filter_log(&data, &[20, 20], 2.0);
+        assert_eq!(out.len(), 400);
+    }
+
+    #[test]
+    fn test_filter_log_3d_shape() {
+        let data = vec![1.0f64; 512]; // 8×8×8
+        let out = filter_log(&data, &[8, 8, 8], 1.5);
+        assert_eq!(out.len(), 512);
+    }
+
+    #[test]
+    fn test_filter_log_constant_near_zero() {
+        // LoG of a constant signal should be ≈0 everywhere
+        let data = vec![5.0f64; 64];
+        let out = filter_log(&data, &[64], 2.0);
+        for v in &out {
+            assert!(v.abs() < 1e-6, "LoG of constant: {v}");
+        }
+    }
+
+    // --- non_maximum_suppression ---
+
+    #[test]
+    fn test_nms_2d_shape() {
+        let resp = vec![1.0f64; 100];
+        let orient = vec![0.0f64; 100];
+        let out = non_maximum_suppression(&resp, &orient, 10, 10);
+        assert_eq!(out.len(), 100);
+    }
+
+    #[test]
+    fn test_nms_2d_uniform_suppresses_most() {
+        // Uniform response with horizontal orientation: centre row may survive
+        let resp = vec![1.0f64; 100];
+        let orient = vec![0.0f64; 100]; // θ=0, look left/right
+        let out = non_maximum_suppression(&resp, &orient, 10, 10);
+        // All values should be 0 or 1
+        for v in &out {
+            assert!(*v == 0.0 || (*v - 1.0).abs() < 1e-9);
+        }
+    }
+
+    // --- non_maximum_suppression_3d ---
+
+    #[test]
+    fn test_nms_3d_shape() {
+        let data = vec![1.0f64; 125]; // 5×5×5
+        let out = non_maximum_suppression_3d(&data, &data, &data, 5, 5, 5);
+        assert_eq!(out.len(), 125);
+    }
+
+    // --- threshold_rosin ---
+
+    #[test]
+    fn test_threshold_rosin_bimodal() {
+        // Should return threshold between two clusters
+        let mut data: Vec<f64> = (0..100).map(|_| 0.1).collect();
+        data.extend((0..100).map(|_| 0.9));
+        let t = threshold_rosin(&data);
+        assert!(t > 0.0 && t < 1.0, "threshold = {t}");
+    }
+
+    #[test]
+    fn test_threshold_rosin_empty() {
+        assert_eq!(threshold_rosin(&[]), 0.0);
+    }
+
+    #[test]
+    fn test_threshold_rosin_uniform() {
+        let data = vec![5.0f64; 100];
+        let t = threshold_rosin(&data);
+        assert!((t - 5.0).abs() < 1.0);
+    }
+
+    // --- surface_filter_gauss_3d ---
+
+    #[test]
+    fn test_surface_filter_gauss_3d_shape() {
+        let data = vec![1.0f64; 125]; // 5×5×5
+        let (d2x, d2y, d2z) = surface_filter_gauss_3d(&data, 5, 5, 5, 1.0);
+        assert_eq!(d2x.len(), 125);
+        assert_eq!(d2y.len(), 125);
+        assert_eq!(d2z.len(), 125);
+    }
+
+    // --- awt_1d ---
+
+    #[test]
+    fn test_awt_1d_shape() {
+        let signal: Vec<f64> = (0..64).map(|i| i as f64).collect();
+        let n_bands = 4;
+        let out = awt_1d(&signal, n_bands);
+        assert_eq!(out.len(), 64 * (n_bands + 1));
+    }
+
+    #[test]
+    fn test_awt_1d_reconstruction() {
+        // Perfect reconstruction: sum of detail bands + last approx ≈ original
+        let signal: Vec<f64> = (0..64).map(|i| (i as f64 * 0.1).sin()).collect();
+        let n_bands = 4;
+        let out = awt_1d(&signal, n_bands);
+        let cols = n_bands + 1;
+        for i in 0..64usize {
+            let reconstructed: f64 = (0..cols).map(|k| out[i * cols + k]).sum();
+            assert!(
+                (reconstructed - signal[i]).abs() < 1e-9,
+                "AWT reconstruction error at {i}: {reconstructed} vs {}",
+                signal[i]
+            );
+        }
+    }
+
+    // --- photobleach_correction ---
+
+    #[test]
+    fn test_photobleach_correction_shape() {
+        let data: Vec<f64> = (0..500).map(|i| 1.0 + i as f64 * 0.001).collect();
+        let out = photobleach_correction(&data, 100, 5);
+        assert_eq!(out.len(), 500);
+    }
+
+    #[test]
+    fn test_photobleach_correction_constant() {
+        // Constant signal should not change (no decay)
+        let data = vec![5.0f64; 200];
+        let out = photobleach_correction(&data, 100, 2);
+        assert_eq!(out.len(), 200);
+        // Frame 0 should remain ≈5.0 (reference frame)
+        for v in &out[..100] {
+            assert!((v - 5.0).abs() < 1e-6, "constant correction: {v}");
         }
     }
 }
