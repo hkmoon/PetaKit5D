@@ -548,6 +548,96 @@ pub fn check_major_tile_valid(_tile_info: &str) -> bool {
     true // Placeholder return
 }
 
+// ---------------------------------------------------------------------------
+// normxcorr3_max_shift
+// ---------------------------------------------------------------------------
+
+/// 3-D normalised cross-correlation with a constrained shift range.
+///
+/// Wraps `normxcorr3_fast` and restricts the search to shifts within
+/// `max_shifts`. Returns `(offset, max_corr, cropped_correlation_map)`.
+///
+/// `max_shifts` can be:
+/// - length-3 vector `[mz, my, mx]`: symmetric ± bounds.
+/// - length-6 vector `[lz, ly, lx, uz, uy, ux]`: asymmetric lower/upper.
+///
+/// Offsets follow 0-based MATLAB convention: positive means the template
+/// starts later in the image.
+pub fn normxcorr3_max_shift(
+    template: &[f64],
+    image: &[f64],
+    t_nz: usize,
+    t_ny: usize,
+    t_nx: usize,
+    max_shifts: &[isize],
+) -> (Vec<isize>, f64, Vec<f64>) {
+    if template.is_empty() || image.is_empty() || max_shifts.is_empty() {
+        return (vec![0, 0, 0], 0.0, vec![]);
+    }
+
+    // Parse max_shifts into [lower, upper] bounds (3 each)
+    let (lo, hi): ([isize; 3], [isize; 3]) = if max_shifts.len() >= 6 {
+        (
+            [max_shifts[0], max_shifts[1], max_shifts[2]],
+            [max_shifts[3], max_shifts[4], max_shifts[5]],
+        )
+    } else {
+        let mz = max_shifts[0];
+        let my = if max_shifts.len() > 1 { max_shifts[1] } else { mz };
+        let mx = if max_shifts.len() > 2 { max_shifts[2] } else { mz };
+        ([-mz, -my, -mx], [mz, my, mx])
+    };
+
+    // Use the maximum absolute shift to drive normxcorr3_fast
+    let max_abs = lo.iter().chain(hi.iter()).map(|v| v.unsigned_abs()).max().unwrap_or(0);
+
+    let full_c = normxcorr3_fast(template, image, t_nz, t_ny, t_nx, max_abs);
+    let full_sz = 2 * max_abs + 1;
+    let full_n = full_sz * full_sz * full_sz;
+
+    if full_c.len() < full_n {
+        return (vec![0, 0, 0], 0.0, full_c);
+    }
+
+    // Crop to the valid shift window [lo, hi]
+    let centre = max_abs as isize;
+    let s_z = (lo[0] + centre).clamp(0, full_sz as isize - 1) as usize;
+    let e_z = (hi[0] + centre + 1).clamp(0, full_sz as isize) as usize;
+    let s_y = (lo[1] + centre).clamp(0, full_sz as isize - 1) as usize;
+    let e_y = (hi[1] + centre + 1).clamp(0, full_sz as isize) as usize;
+    let s_x = (lo[2] + centre).clamp(0, full_sz as isize - 1) as usize;
+    let e_x = (hi[2] + centre + 1).clamp(0, full_sz as isize) as usize;
+
+    let oz = e_z.saturating_sub(s_z);
+    let oy = e_y.saturating_sub(s_y);
+    let ox = e_x.saturating_sub(s_x);
+
+    let mut cropped = vec![0.0f64; oz * oy * ox];
+    for iz in 0..oz {
+        for iy in 0..oy {
+            for ix in 0..ox {
+                let fi = (iz + s_z) * full_sz * full_sz + (iy + s_y) * full_sz + (ix + s_x);
+                cropped[iz * oy * ox + iy * ox + ix] = full_c[fi];
+            }
+        }
+    }
+
+    // Find maximum
+    let (max_i, max_corr) = cropped.iter().enumerate()
+        .fold((0, f64::NEG_INFINITY), |(bi, bv), (i, &v)| if v > bv { (i, v) } else { (bi, bv) });
+
+    let cz = (max_i / (oy * ox)) as isize;
+    let cy = ((max_i % (oy * ox)) / ox) as isize;
+    let cx = (max_i % ox) as isize;
+
+    // Convert to shift offset (0-based)
+    let off_z = cz + lo[0];
+    let off_y = cy + lo[1];
+    let off_x = cx + lo[2];
+
+    (vec![off_z, off_y, off_x], max_corr, cropped)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -691,5 +781,33 @@ mod tests {
     fn test_check_major_tile_valid() {
         let result = check_major_tile_valid("valid_tile");
         assert!(result);
+    }
+
+    // --- normxcorr3_max_shift ---
+
+    #[test]
+    fn test_normxcorr3_max_shift_shape() {
+        let t = vec![1.0f64; 8]; // 2×2×2
+        let a = vec![1.0f64; 64]; // 4×4×4
+        let (off, _corr, c) = normxcorr3_max_shift(&t, &a, 2, 2, 2, &[2, 2, 2]);
+        assert_eq!(off.len(), 3);
+        // Cropped map is at most (2+2+1)^3 = 125 but may be smaller due to clamping
+        assert!(!c.is_empty());
+    }
+
+    #[test]
+    fn test_normxcorr3_max_shift_empty() {
+        let (off, corr, c) = normxcorr3_max_shift(&[], &[], 0, 0, 0, &[1, 1, 1]);
+        assert_eq!(off, vec![0, 0, 0]);
+        assert_eq!(corr, 0.0);
+        assert!(c.is_empty());
+    }
+
+    #[test]
+    fn test_normxcorr3_max_shift_asymmetric() {
+        let t = vec![1.0f64; 8];
+        let a = vec![1.0f64; 64];
+        let (off, _corr, _c) = normxcorr3_max_shift(&t, &a, 2, 2, 2, &[-1, -1, -1, 2, 2, 2]);
+        assert_eq!(off.len(), 3);
     }
 }
